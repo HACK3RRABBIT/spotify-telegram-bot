@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="https://github.com/YOUR_USERNAME/spotify-telegram-bot"
+REPO="https://github.com/HACK3RRABBIT/spotify-telegram-bot"
 INSTALL_DIR="/opt/spotify-telegram-bot"
 CONDA_ENV="spotify-downloader"
 

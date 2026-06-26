@@ -20,7 +20,7 @@ Send a Spotify track or album link to the bot, and it replies with the audio fil
 ## Quick Install
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/spotify-telegram-bot/main/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/HACK3RRABBIT/spotify-telegram-bot/main/install.sh)"
 ```
 
 During install you'll be prompted for your bot token. After that the service starts automatically.
@@ -30,7 +30,7 @@ During install you'll be prompted for your bot token. After that the service sta
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/spotify-telegram-bot.git
+git clone https://github.com/HACK3RRABBIT/spotify-telegram-bot.git
 cd spotify-telegram-bot
 ```
 
