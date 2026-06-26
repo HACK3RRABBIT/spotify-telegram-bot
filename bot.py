@@ -172,16 +172,23 @@ async def _auto_refresh_cookies() -> None:
             logger.error("Cookie refresh error: %s", e)
 
 
-# yt-dlp attempt strategies (tried in order until one succeeds):
-#   1. android_vr client  — uses YouTube's TV/mobile API, less bot-checked
-#   2. ios client         — another mobile endpoint
-#   3. mweb client        — mobile web, different fingerprint
-# Each attempt also uses WARP proxy + bgutil PO tokens + cookies if available.
-_YT_CLIENT_STRATEGIES = [
-    ["--extractor-args", "youtube:player_client=android_vr"],
-    ["--extractor-args", "youtube:player_client=ios"],
-    ["--extractor-args", "youtube:player_client=mweb"],
-    [],  # last resort: yt-dlp default (web client)
+# yt-dlp YouTube client strategies.
+# Key rule: mobile clients (android_vr, ios, android) IGNORE --cookies entirely.
+# So we never mix cookies with mobile clients.
+#
+# Each entry is (client_args, use_cookies).
+# When cookies exist:   try web+cookies+deno first, then android_vr (no cookies)
+# When no cookies:      try android_vr, then mweb, then default
+_YT_STRATEGIES_WITH_COOKIES = [
+    # web client + cookies + Deno JS runtime (solves n-challenge)
+    (["--extractor-args", "youtube:player_client=web", "--js-runtimes", "deno"], True),
+    # mobile fallback — ignores cookies but still works via WARP
+    (["--extractor-args", "youtube:player_client=android_vr"], False),
+]
+_YT_STRATEGIES_NO_COOKIES = [
+    (["--extractor-args", "youtube:player_client=android_vr"], False),
+    (["--extractor-args", "youtube:player_client=mweb"], False),
+    ([], False),  # yt-dlp default
 ]
 
 
@@ -642,15 +649,20 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
         fmt_args = ["--format", q_fmt]
         ext_glob = f"*.{AUDIO_FORMAT}"
 
-    base_cmd = [_YTDLP] + _cookie_args() + no_pl + fmt_args + [
+    has_cookies = os.path.isfile(_COOKIES)
+    strategies = _YT_STRATEGIES_WITH_COOKIES if has_cookies else _YT_STRATEGIES_NO_COOKIES
+
+    proxy_args = ["--proxy", YTDLP_PROXY] if YTDLP_PROXY else []
+    base_cmd = [_YTDLP] + proxy_args + no_pl + fmt_args + [
         "--add-metadata", "--newline", "--output", out_tmpl,
     ]
 
     # Try each client strategy in order until one produces a file
     error_type: str | None = None
-    for attempt, client_args in enumerate(_YT_CLIENT_STRATEGIES):
-        cmd = base_cmd + client_args + [url]
-        logger.info("yt-dlp attempt %d: %s", attempt + 1, " ".join(cmd))
+    for attempt, (client_args, use_cookies) in enumerate(strategies):
+        cookie_args = ["--cookies", _COOKIES] if (use_cookies and has_cookies) else []
+        cmd = base_cmd + cookie_args + client_args + [url]
+        logger.info("yt-dlp attempt %d (cookies=%s): %s", attempt + 1, use_cookies, " ".join(cmd))
 
         if attempt > 0:
             try:
@@ -721,7 +733,10 @@ async def _ytdlp_video_download(url: str, out_dir: Path, msg) -> tuple[list[Path
     """Download a YouTube video (up to 50MB) with audio merged."""
     out_tmpl = str(out_dir / "%(title)s.%(ext)s")
     # Best video+audio up to ~720p merged into mp4; cap size to stay under 50MB
-    cmd = [_YTDLP] + _cookie_args() + [
+    has_cookies = os.path.isfile(_COOKIES)
+    strategies = _YT_STRATEGIES_WITH_COOKIES if has_cookies else _YT_STRATEGIES_NO_COOKIES
+    proxy_args = ["--proxy", YTDLP_PROXY] if YTDLP_PROXY else []
+    base_cmd = [_YTDLP] + proxy_args + [
         "--format", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
         "--merge-output-format", "mp4",
         "--no-playlist",
@@ -730,9 +745,10 @@ async def _ytdlp_video_download(url: str, out_dir: Path, msg) -> tuple[list[Path
         "--output", out_tmpl,
     ]
 
-    for attempt, client_args in enumerate(_YT_CLIENT_STRATEGIES):
-        full_cmd = cmd + client_args + [url]
-        logger.info("yt-dlp video attempt %d", attempt + 1)
+    for attempt, (client_args, use_cookies) in enumerate(strategies):
+        cookie_args = ["--cookies", _COOKIES] if (use_cookies and has_cookies) else []
+        full_cmd = base_cmd + cookie_args + client_args + [url]
+        logger.info("yt-dlp video attempt %d (cookies=%s)", attempt + 1, use_cookies)
         if attempt > 0:
             try: await msg.edit_text(f"⚠️ Retrying video download (method {attempt + 1}/4)...")
             except Exception: pass
