@@ -1052,25 +1052,25 @@ async def handle_cookies_file(update: Update, context) -> None:
     doc = update.message.document
     if not doc:
         return
-    if not (doc.file_name or "").lower().endswith(".txt"):
-        await update.message.reply_text(
-            "Please send a .txt file (Netscape format cookies exported from your browser).")
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".txt"):
+        # Silently ignore non-txt documents (photos, audio, etc.)
         return
     try:
-        f = await context.bot.get_file(doc.file_id)
-        content = bytes()
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(f.file_path)
-            r.raise_for_status()
-            content = r.content
+        tg_file = await context.bot.get_file(doc.file_id)
+        import io
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        content = buf.getvalue()
         text = content.decode(errors="replace")
-        if "youtube.com" not in text.lower() and "# Netscape HTTP Cookie" not in text:
+        if "youtube.com" not in text.lower() and "netscape http cookie" not in text.lower():
             await update.message.reply_text(
-                "⚠️ This doesn't look like a YouTube cookies file. "
-                "Export it from youtube.com using a browser extension like 'Get cookies.txt LOCALLY'.")
+                "⚠️ This doesn't look like a YouTube cookies file.\n"
+                "Export from youtube.com using 'Get cookies.txt LOCALLY' browser extension.")
             return
         with open(_COOKIES, "wb") as fh:
             fh.write(content)
+        logger.info("cookies.txt saved (%d bytes, %d lines)", len(content), text.count("\n"))
         logger.info("cookies.txt updated from Telegram upload (%d bytes)", len(content))
 
         # Quick validation: try fetching a known public video with these cookies
@@ -1122,7 +1122,8 @@ def main() -> None:
            .build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_cookies_file))
+    # Accept any document — handler checks for .txt extension itself
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_cookies_file))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
     logger.info("Bot running — MAX_CONCURRENT=%d  cookie_email=%s",
