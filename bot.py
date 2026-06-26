@@ -200,27 +200,55 @@ async def _fetch_oembed_fallback(url: str) -> dict | None:
         return None
 
 
-_RE_SONGS = re.compile(r"(\d+)\s+Song", re.I)
+async def _fetch_spotify_info(url: str, msg=None) -> dict | None:
+    """
+    Fetch Spotify metadata.
+    - For single tracks: use fast oEmbed (< 1s).
+    - For playlists/albums/artists: run spotdl save to get full track list.
+    """
+    m = _RE_SPOTIFY.search(url)
+    kind = m.group(1) if m else "track"
 
-
-async def _fetch_spotify_info(url: str) -> dict | None:
-    """Quick Spotify metadata via the public oembed endpoint (no auth needed)."""
+    # Always get the display title from oEmbed (fast)
+    title = None
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(
-                "https://open.spotify.com/oembed", params={"url": url})
-            if r.status_code != 200:
-                return None
-            d = r.json()
-    except Exception as e:
-        logger.warning("Spotify oembed failed: %s", e)
-        return None
+            r = await client.get("https://open.spotify.com/oembed", params={"url": url})
+            if r.status_code == 200:
+                title = r.json().get("title", "")
+    except Exception:
+        pass
 
-    title = d.get("title", "")
-    desc  = d.get("description", "")  # e.g. "50 Songs. 3 hours, 44 minutes."
-    m     = _RE_SONGS.search(desc)
-    count = int(m.group(1)) if m else None
-    return {"title": title, "count": count, "description": desc}
+    if kind == "track":
+        return {"title": title or "Track", "count": 1, "songs": []}
+
+    # For playlist / album / artist — run spotdl save to get track list
+    if msg:
+        try:
+            await msg.edit_text(f"🔍 Fetching track list...")
+        except Exception:
+            pass
+
+    with tempfile.TemporaryDirectory() as td:
+        save_file = Path(td) / "meta.spotdl"
+        out, rc = await _run(
+            [_SPOTDL, "save", url, "--save-file", str(save_file)],
+            timeout=180,
+        )
+        if not save_file.exists():
+            logger.warning("spotdl save produced no file for %s: %s", url, out[:200])
+            return {"title": title or kind.capitalize(), "count": None, "songs": []}
+        try:
+            data  = json.loads(save_file.read_text())
+            songs = data if isinstance(data, list) else [data]
+        except Exception:
+            songs = []
+
+    return {
+        "title": title or kind.capitalize(),
+        "count": len(songs),
+        "songs": songs,   # list of {name, artist, ...}
+    }
 
 
 # ── Confirm UI ────────────────────────────────────────────────────────────────
@@ -238,16 +266,29 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
         m    = _RE_SPOTIFY.search(url)
         kind = m.group(1) if m else "track"
         icons  = {"track": "🎵", "album": "💿", "playlist": "📋", "artist": "🎤"}
-        labels = {"track": "Track", "album": "Album", "playlist": "Playlist", "artist": "Artist"}
         icon  = icons.get(kind, "🎵")
-        label = labels.get(kind, "Track")
-        if info and info.get("title"):
-            title_line = f"{icon} {info['title']}"
-            if info.get("count"):
-                title_line += f"\n🎶 {info['count']} tracks"
-        else:
-            title_line = f"{icon} Spotify {label}"
-        text = f"{title_line}\n\nDownload?"
+        pl_title = (info or {}).get("title") or f"Spotify {kind.capitalize()}"
+        songs    = (info or {}).get("songs", [])
+        count    = (info or {}).get("count") or len(songs)
+
+        title_line = f"{icon} *{pl_title}*"
+        if count:
+            title_line += f"\n🎶 {count} track{'s' if count != 1 else ''}"
+
+        # Show track listing for playlists/albums
+        track_list = ""
+        if songs and kind != "track":
+            preview = songs[:15]
+            lines = []
+            for i, s in enumerate(preview, 1):
+                artist = s.get("artist", "")
+                name   = s.get("name", "")
+                lines.append(f"{i}. {artist} — {name}" if artist else f"{i}. {name}")
+            track_list = "\n" + "\n".join(lines)
+            if count and count > 15:
+                track_list += f"\n... and {count - 15} more"
+
+        text = f"{title_line}{track_list}\n\nDownload?"
         kb   = InlineKeyboardMarkup([[
             InlineKeyboardButton("▶️ Download", callback_data=f"dl:{token}:best"),
             InlineKeyboardButton("❌ Cancel",   callback_data=f"no:{token}"),
@@ -304,7 +345,9 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
         "url": url,
         "platform": platform,
         "is_playlist": is_playlist,
+        "songs": (info or {}).get("songs", []) if platform == "spotify" else [],
         "expires": time.time() + CONFIRM_TTL,
+        "reply_to": None,  # filled in handle_message
     }
     return text, kb, token
 
@@ -353,21 +396,25 @@ async def _spotdl_download(url: str, out_dir: Path, msg) -> list[Path]:
     return sorted(p for p in out_dir.rglob("*.mp3") if p.is_file())
 
 
-async def _spotdl_save_ytdlp(url: str, out_dir: Path, msg) -> list[Path]:
+async def _spotdl_save_ytdlp(url: str, out_dir: Path, msg, prefetched_songs: list | None = None) -> list[Path]:
     """Fallback for Spotify: resolve metadata via spotdl save, then yt-dlp per track."""
-    save_file = out_dir / "meta.spotdl"
     out_dir.mkdir(parents=True, exist_ok=True)
-    await msg.edit_text("🔍 Fetching track list from Spotify...")
-    out, _ = await _run(
-        [_SPOTDL, "save", url, "--save-file", str(save_file)], timeout=180)
-    logger.info("spotdl save: %s", out[:300])
-    if not save_file.exists():
-        return []
-    try:
-        data  = json.loads(save_file.read_text())
-        songs = data if isinstance(data, list) else [data]
-    except Exception:
-        return []
+
+    if prefetched_songs:
+        songs = prefetched_songs
+    else:
+        save_file = out_dir / "meta.spotdl"
+        await msg.edit_text("🔍 Fetching track list from Spotify...")
+        out, _ = await _run(
+            [_SPOTDL, "save", url, "--save-file", str(save_file)], timeout=180)
+        logger.info("spotdl save: %s", out[:300])
+        if not save_file.exists():
+            return []
+        try:
+            data  = json.loads(save_file.read_text())
+            songs = data if isinstance(data, list) else [data]
+        except Exception:
+            return []
 
     total = len(songs)
     files: list[Path] = []
@@ -458,7 +505,7 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
 
 # ── Upload helper ─────────────────────────────────────────────────────────────
 
-async def _send_audio(bot, chat_id: int, f: Path) -> bool:
+async def _send_audio(bot, chat_id: int, f: Path, reply_to: int | None = None) -> bool:
     """Upload one mp3 to Telegram. Returns True on success."""
     size = f.stat().st_size
     if size > MAX_FILE_BYTES:
@@ -466,7 +513,8 @@ async def _send_audio(bot, chat_id: int, f: Path) -> bool:
         try:
             await bot.send_message(
                 chat_id,
-                f"⚠️ {f.stem[:60]} is {size >> 20} MB — too large for Telegram, skipped.")
+                f"⚠️ {f.stem[:60]} is {size >> 20} MB — too large for Telegram, skipped.",
+                reply_to_message_id=reply_to)
         except Exception:
             pass
         return False
@@ -475,6 +523,7 @@ async def _send_audio(bot, chat_id: int, f: Path) -> bool:
             await bot.send_audio(
                 chat_id=chat_id, audio=fh,
                 title=f.stem[:64], filename=f.name,
+                reply_to_message_id=reply_to,
                 read_timeout=120, write_timeout=120)
         return True
     except Exception as e:
@@ -495,6 +544,7 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
     platform    = ctx["platform"]
     quality     = ctx.get("quality", "best")
     is_playlist = ctx.get("is_playlist", False)
+    reply_to    = ctx.get("reply_to")
 
     if _active >= MAX_CONCURRENT:
         try:
@@ -519,7 +569,10 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
                 files = await _spotdl_download(url, out_dir / "direct", msg)
                 if not files:
                     logger.info("spotdl direct returned no files — trying save+yt-dlp fallback")
-                    files = await _spotdl_save_ytdlp(url, out_dir / "fallback", msg)
+                    files = await _spotdl_save_ytdlp(
+                        url, out_dir / "fallback", msg,
+                        prefetched_songs=ctx.get("songs") or None,
+                    )
                 err = None if files else "auth"
             else:
                 out_dir.mkdir(exist_ok=True)
@@ -554,7 +607,7 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
 
             sent = 0
             for f in files:
-                if await _send_audio(bot, chat_id, f):
+                if await _send_audio(bot, chat_id, f, reply_to=reply_to):
                     sent += 1
                 await asyncio.sleep(0.4)  # avoid Telegram flood limits
 
@@ -614,15 +667,18 @@ async def handle_message(update: Update, context) -> None:
     platform = "spotify" if is_sp else ("youtube" if is_yt else "soundcloud")
     info = None
     if is_sp:
-        info = await _fetch_spotify_info(text)  # best-effort, None is fine
+        info = await _fetch_spotify_info(text, msg=msg)
     else:
         info = await _fetch_yt_sc_info(text)
         if info is None:
             logger.warning("Info fetch returned None for %s — showing generic confirm", text)
             # Fall through with info=None; _build_confirm handles it gracefully
 
-    confirm_text, kb, _ = _build_confirm(text, platform, info)
-    await msg.edit_text(confirm_text, reply_markup=kb)
+    confirm_text, kb, token = _build_confirm(text, platform, info)
+    # Store the original message ID so uploads can reply to it
+    if token in _pending:
+        _pending[token]["reply_to"] = update.message.message_id
+    await msg.edit_text(confirm_text, reply_markup=kb, parse_mode="Markdown")
 
 
 async def handle_callback(update: Update, context) -> None:

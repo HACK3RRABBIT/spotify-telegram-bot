@@ -4,12 +4,14 @@ After=network.target
 
 [Service]
 Type=simple
-User=%i
-WorkingDirectory=/opt/spotify-telegram-bot
-EnvironmentFile=/opt/spotify-telegram-bot/.env
-ExecStart=/home/funlife/miniconda3/envs/spotify-downloader/bin/python /opt/spotify-telegram-bot/bot.py
+User=funlife
+WorkingDirectory=/home/funlife/spotify-telegram-bot
+EnvironmentFile=/home/funlife/spotify-telegram-bot/.env
+ExecStart=/home/funlife/miniconda3/envs/spotify-downloader/bin/python /home/funlife/spotify-telegram-bot/bot.py
 Restart=on-failure
 RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
