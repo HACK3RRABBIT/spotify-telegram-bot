@@ -668,7 +668,6 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
                         pass
                 last_edit = now
 
-    await proc.wait()
         await proc.wait()
 
         # Check if we got files — if yes, stop retrying
