@@ -169,14 +169,18 @@ async def _fetch_yt_sc_info(url: str) -> dict | None:
 
     if d.get("_type") == "playlist":
         entries = d.get("entries") or []
-        tracks = [
-            {
-                "title":    e.get("title", ""),
+        tracks = []
+        for e in entries:
+            title = e.get("title", "")
+            # SoundCloud flat-playlist entries often have no title — derive from URL slug
+            if not title:
+                url_slug = (e.get("url") or e.get("webpage_url") or "").rstrip("/").split("/")[-1]
+                title = url_slug.replace("-", " ").title() if url_slug else ""
+            tracks.append({
+                "title":    title,
                 "uploader": e.get("uploader") or e.get("channel", ""),
                 "duration": _dur(e.get("duration")),
-            }
-            for e in entries
-        ]
+            })
         return {
             "kind":    "playlist",
             "count":   len(entries),
