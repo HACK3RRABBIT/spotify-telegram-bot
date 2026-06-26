@@ -99,7 +99,8 @@ _pending: dict[str, dict] = {}     # confirm token → context
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
-_RE_PCT      = re.compile(r"\[download\]\s+([\d.]+)%")
+_RE_PCT      = re.compile(r"\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\S+/s)", re.I)
+_RE_PCT_ONLY = re.compile(r"\[download\]\s+([\d.]+)%")
 _RE_ITEM     = re.compile(r"\[download\] Downloading item (\d+) of (\d+)")
 _RE_SPOTPROG = re.compile(r"(\d+)/(\d+) complete")
 
@@ -563,6 +564,7 @@ async def _spotdl_download(url: str, out_dir: Path, msg) -> list[Path]:
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 
     done = total = 0
+    speed = ""
     last_edit = asyncio.get_event_loop().time()
 
     async for raw in proc.stdout:
@@ -570,16 +572,22 @@ async def _spotdl_download(url: str, out_dir: Path, msg) -> list[Path]:
         if not line:
             continue
         logger.info("spotdl: %s", line)
+
+        mp = _RE_PCT.search(line)
+        if mp:
+            speed = mp.group(2)
+
         m = _RE_SPOTPROG.search(line)
         if m:
             done, total = int(m.group(1)), int(m.group(2))
             now = asyncio.get_event_loop().time()
             if now - last_edit >= 2:
+                spd = f" • {speed}" if speed else ""
                 if total > 1:
                     pct  = int(done * 100 / total)
-                    text = f"📥 Track {done}/{total}\n{_bar(pct)} {pct}%"
+                    text = f"📥 File {done}/{total}{spd}\n{_bar(pct)} {pct}%"
                 else:
-                    text = "📥 Downloading..."
+                    text = f"📥 Downloading{spd}..."
                 try:
                     await msg.edit_text(text)
                 except Exception:
@@ -693,6 +701,8 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 
         cur = tot = 0
+        speed = ""
+        done_count = 0
         attempt_error: str | None = None
         last_edit = asyncio.get_event_loop().time()
 
@@ -713,18 +723,34 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
             if mi:
                 cur, tot = int(mi.group(1)), int(mi.group(2))
 
+            if "[download] 100%" in line and cur > 0:
+                done_count = cur
+
             mp = _RE_PCT.search(line)
             if mp:
                 pct = min(int(float(mp.group(1))), 100)
+                speed = mp.group(2)
+            else:
+                mp2 = _RE_PCT_ONLY.search(line)
+                if mp2:
+                    pct = min(int(float(mp2.group(1))), 100)
+                else:
+                    pct = None
+
+            if pct is not None:
                 now = asyncio.get_event_loop().time()
-                if now - last_edit >= 3:
-                    text = (f"📥 Track {cur}/{tot}\n{_bar(pct)} {pct}%"
-                            if tot > 1 else f"📥 Downloading...\n{_bar(pct)} {pct}%")
+                if now - last_edit >= 2:
+                    spd = f" • {speed}" if speed else ""
+                    if tot > 1:
+                        text = (f"📥 File {cur}/{tot}{spd}\n"
+                                f"{_bar(pct)} {pct}%")
+                    else:
+                        text = f"📥 Downloading{spd}\n{_bar(pct)} {pct}%"
                     try:
                         await msg.edit_text(text)
                     except Exception:
                         pass
-                last_edit = now
+                    last_edit = now
 
         await proc.wait()
 
@@ -771,6 +797,7 @@ async def _ytdlp_video_download(url: str, out_dir: Path, msg) -> tuple[list[Path
             *full_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 
         attempt_error = None
+        speed = ""
         last_edit = asyncio.get_event_loop().time()
         async for raw in proc.stdout:
             line = raw.decode(errors="replace").rstrip()
@@ -780,11 +807,19 @@ async def _ytdlp_video_download(url: str, out_dir: Path, msg) -> tuple[list[Path
             elif _RE_DRM_ERR.search(line): attempt_error = "drm"
             elif _RE_GEO_ERR.search(line): attempt_error = "geo"
             mp = _RE_PCT.search(line)
+            pct = None
             if mp:
                 pct = min(int(float(mp.group(1))), 100)
+                speed = mp.group(2)
+            else:
+                mp2 = _RE_PCT_ONLY.search(line)
+                if mp2:
+                    pct = min(int(float(mp2.group(1))), 100)
+            if pct is not None:
                 now = asyncio.get_event_loop().time()
-                if now - last_edit >= 3:
-                    try: await msg.edit_text(f"📥 Downloading video...\n{_bar(pct)} {pct}%")
+                if now - last_edit >= 2:
+                    spd = f" • {speed}" if speed else ""
+                    try: await msg.edit_text(f"🎬 Downloading video{spd}\n{_bar(pct)} {pct}%")
                     except Exception: pass
                     last_edit = now
 
