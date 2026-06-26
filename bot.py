@@ -648,10 +648,10 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
         ext_glob = "*.mp3"
     else:
         q_fmt = {
-            "best": f"bestaudio[ext={AUDIO_FORMAT}]/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
-            "mid":  "bestaudio[abr<=128]/bestaudio",
-            "low":  "bestaudio[abr<=64]/bestaudio",
-        }.get(quality, f"bestaudio[ext={AUDIO_FORMAT}]/bestaudio")
+            "best": f"bestaudio[ext={AUDIO_FORMAT}]/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "mid":  "bestaudio[abr<=128]/bestaudio/best",
+            "low":  "bestaudio[abr<=64]/bestaudio/best",
+        }.get(quality, f"bestaudio[ext={AUDIO_FORMAT}]/bestaudio/best")
         fmt_args = ["--format", q_fmt]
         ext_glob = f"*.{AUDIO_FORMAT}"
 
