@@ -44,6 +44,13 @@ MAX_CONCURRENT = 3          # simultaneous downloads
 MAX_FILE_BYTES = 49 << 20  # 49 MB — Telegram bot upload limit
 CONFIRM_TTL    = 300        # seconds a confirm button stays active
 
+# Optional residential proxy to bypass YouTube's server IP block.
+# Set YTDLP_PROXY in .env to a proxy URL, e.g.:
+#   YTDLP_PROXY=http://user:pass@proxy.webshare.io:80
+#   YTDLP_PROXY=socks5://user:pass@gate.smartproxy.com:7000
+# Leave unset to connect directly (YouTube may block the server IP).
+YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
+
 
 # ── Binary / path resolution ──────────────────────────────────────────────────
 def _find_bin(name: str) -> str:
@@ -99,7 +106,16 @@ def _dur(s) -> str:
 
 
 def _cookie_args() -> list[str]:
-    return ["--cookies", _COOKIES] if os.path.isfile(_COOKIES) else []
+    args = []
+    if os.path.isfile(_COOKIES):
+        args += ["--cookies", _COOKIES]
+    if YTDLP_PROXY:
+        args += ["--proxy", YTDLP_PROXY]
+    return args
+
+
+def _spotdl_proxy_args() -> list[str]:
+    return ["--proxy", YTDLP_PROXY] if YTDLP_PROXY else []
 
 
 async def _run(cmd: list[str], timeout: int = 60) -> tuple[str, int]:
@@ -301,7 +317,7 @@ async def _spotdl_download(url: str, out_dir: Path, msg) -> list[Path]:
         "--output", str(out_dir / "{title}"),
         "--overwrite", "force",
         "--simple-tui",
-    ] + cookie_args
+    ] + cookie_args + _spotdl_proxy_args()
     logger.info("spotdl cmd: %s", " ".join(cmd))
 
     proc = await asyncio.create_subprocess_exec(
