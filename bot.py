@@ -74,11 +74,13 @@ _COOKIES = os.path.join(_BOT_DIR, "cookies.txt")
 
 
 # ── URL patterns ──────────────────────────────────────────────────────────────
-_RE_SPOTIFY    = re.compile(
+_RE_SPOTIFY     = re.compile(
     r"https?://open\.spotify\.com/(track|album|playlist|artist)/\S+", re.I)
-_RE_YOUTUBE    = re.compile(
-    r"https?://(?:(?:www\.|music\.)?youtube\.com|youtu\.be)/\S+", re.I)
-_RE_SOUNDCLOUD = re.compile(
+_RE_YT_MUSIC    = re.compile(
+    r"https?://music\.youtube\.com/\S+", re.I)
+_RE_YOUTUBE     = re.compile(
+    r"https?://(?:(?:www\.)?youtube\.com|youtu\.be)/\S+", re.I)
+_RE_SOUNDCLOUD  = re.compile(
     r"https?://(?:www\.)?soundcloud\.com/\S+", re.I)
 
 
@@ -203,13 +205,11 @@ def _clean_pending() -> None:
 # ── Quick metadata fetch (no download) ───────────────────────────────────────
 
 async def _fetch_yt_sc_info(url: str) -> dict | None:
-    """Fetch title / track list from YouTube or SoundCloud without downloading."""
-    is_sc = "soundcloud.com" in url.lower()
-
-    if is_sc:
+    """Fetch title / track list from YouTube, YouTube Music or SoundCloud."""
+    if "soundcloud.com" in url.lower():
         return await _fetch_sc_info(url)
-    else:
-        return await _fetch_yt_info(url)
+    is_yt_music = "music.youtube.com" in url.lower()
+    return await _fetch_yt_info(url, is_yt_music=is_yt_music)
 
 
 async def _fetch_sc_info(url: str) -> dict | None:
@@ -264,23 +264,63 @@ async def _fetch_sc_info(url: str) -> dict | None:
     }
 
 
-async def _fetch_yt_info(url: str) -> dict | None:
-    """YouTube: use yt-dlp --flat-playlist -J for fast metadata."""
+async def _oembed_yt(url: str) -> dict | None:
+    """YouTube oEmbed — instant, no yt-dlp, works even when IP is blocked."""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get("https://www.youtube.com/oembed",
+                                 params={"url": url, "format": "json"})
+            if r.status_code != 200:
+                return None
+            d = r.json()
+        return {
+            "kind": "single", "count": 1,
+            "title":   d.get("title", "YouTube Video"),
+            "channel": d.get("author_name", ""),
+            "duration": "",
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_yt_info(url: str, is_yt_music: bool = False) -> dict | None:
+    """YouTube: oEmbed first (instant), then yt-dlp for playlists/duration."""
+    # For a single video: oEmbed is instant and reliable
+    is_playlist_url = ("list=" in url or "/playlist" in url)
+
+    if not is_playlist_url:
+        info = await _oembed_yt(url)
+        if info:
+            info["is_yt_music"] = is_yt_music
+            return info
+
+    # For playlists or if oEmbed failed: use yt-dlp with short timeout
     proc = await asyncio.create_subprocess_exec(
-        *([_YTDLP] + _cookie_args() + ["--flat-playlist", "-J", "--no-warnings", url]),
+        *([_YTDLP] + _cookie_args() + [
+            "--flat-playlist", "-J", "--no-warnings",
+            "--extractor-args", "youtube:player_client=android_vr",
+            url,
+        ]),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
     try:
-        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
     except asyncio.TimeoutError:
         proc.kill()
-        return await _fetch_oembed_fallback(url)
+        # Fall back to oEmbed for single video
+        info = await _oembed_yt(url)
+        if info:
+            info["is_yt_music"] = is_yt_music
+        return info
 
     try:
         d = json.loads(out_bytes.decode(errors="replace").strip())
     except Exception:
-        return await _fetch_oembed_fallback(url)
+        info = await _oembed_yt(url)
+        if info:
+            info["is_yt_music"] = is_yt_music
+        return info
 
     if d.get("_type") == "playlist":
         entries = d.get("entries") or []
@@ -293,40 +333,22 @@ async def _fetch_yt_info(url: str) -> dict | None:
             for e in entries
         ]
         return {
-            "kind":    "playlist",
-            "count":   len(entries),
-            "title":   d.get("title", "Playlist"),
-            "channel": d.get("uploader") or d.get("channel", ""),
-            "tracks":  tracks,
+            "kind":       "playlist",
+            "count":      len(entries),
+            "title":      d.get("title", "Playlist"),
+            "channel":    d.get("uploader") or d.get("channel", ""),
+            "tracks":     tracks,
+            "is_yt_music": is_yt_music,
         }
     return {
-        "kind":     "single",
-        "count":    1,
-        "title":    d.get("title", "Track"),
-        "duration": _dur(d.get("duration")),
-        "channel":  d.get("uploader") or d.get("channel", ""),
+        "kind":       "single",
+        "count":      1,
+        "title":      d.get("title", "Track"),
+        "duration":   _dur(d.get("duration")),
+        "channel":    d.get("uploader") or d.get("channel", ""),
+        "is_video":   not is_yt_music,
+        "is_yt_music": is_yt_music,
     }
-
-
-async def _fetch_oembed_fallback(url: str) -> dict | None:
-    """YouTube public oEmbed API — works even when server IP is blocked for downloads."""
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get("https://www.youtube.com/oembed",
-                                 params={"url": url, "format": "json"})
-            if r.status_code != 200:
-                return None
-            d = r.json()
-        return {
-            "kind": "single", "count": 1,
-            "title": d.get("title", "YouTube Video"),
-            "channel": d.get("author_name", ""),
-            "duration": "",
-            "blocked": True,
-        }
-    except Exception as e:
-        logger.warning("oEmbed fallback also failed for %s: %s", url, e)
-        return None
 
 
 async def _fetch_spotify_info(url: str, msg=None) -> dict | None:
@@ -435,8 +457,10 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
         is_playlist = kind in ("album", "playlist", "artist")
 
     elif platform == "youtube":
+        is_yt_music = (info or {}).get("is_yt_music", False)
+        yt_icon = "🎵" if is_yt_music else "🎬"
         if info is None:
-            text = "▶️ YouTube\n\nDownload?"
+            text = f"{yt_icon} YouTube\n\nDownload?"
             kb   = InlineKeyboardMarkup([[
                 InlineKeyboardButton("▶️ Download", callback_data=f"dl:{token}:best"),
                 InlineKeyboardButton("❌ Cancel",   callback_data=f"no:{token}"),
@@ -444,25 +468,32 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
         elif info["kind"] == "playlist":
             is_playlist = True
             track_list  = _format_track_list(info.get("tracks", []), info["count"])
+            label = "tracks" if is_yt_music else "videos"
             text = (f"📋 *{info['title']}*\n"
-                    f"🎵 {info['count']} videos"
-                    f"{track_list}\n\nDownload all {info['count']} tracks?")
+                    f"{yt_icon} {info['count']} {label}"
+                    f"{track_list}\n\nDownload all {info['count']} {label}?")
             kb   = InlineKeyboardMarkup([[
                 InlineKeyboardButton("▶️ Download all", callback_data=f"dl:{token}:best"),
                 InlineKeyboardButton("❌ Cancel",        callback_data=f"no:{token}"),
             ]])
         else:
-            ch      = f"\n👤 {info['channel']}" if info.get("channel") else ""
-            dur     = f"  ⏱ {info['duration']}"  if info.get("duration") else ""
-            blocked = info.get("blocked", False)
-            warn    = "\n\n⚠️ Server IP may be blocked by YouTube.\nDownload might fail — try anyway?" if blocked else "\n\nChoose audio quality:"
-            text = f"▶️ *{info['title']}*{ch}{dur}{warn}"
-            kb   = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔊 Best (320k)",   callback_data=f"dl:{token}:best"),
-                 InlineKeyboardButton("🎧 Medium (128k)", callback_data=f"dl:{token}:mid"),
-                 InlineKeyboardButton("🔈 Low (64k)",     callback_data=f"dl:{token}:low")],
-                [InlineKeyboardButton("❌ Cancel",          callback_data=f"no:{token}")],
-            ])
+            ch  = f"\n👤 {info['channel']}" if info.get("channel") else ""
+            dur = f"  ⏱ {info['duration']}"  if info.get("duration") else ""
+            if is_yt_music:
+                text = f"🎵 *{info['title']}*{ch}{dur}\n\nChoose audio quality:"
+                kb   = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔊 Best",   callback_data=f"dl:{token}:best"),
+                     InlineKeyboardButton("🎧 Medium", callback_data=f"dl:{token}:mid"),
+                     InlineKeyboardButton("🔈 Low",    callback_data=f"dl:{token}:low")],
+                    [InlineKeyboardButton("❌ Cancel",   callback_data=f"no:{token}")],
+                ])
+            else:
+                text = f"🎬 *{info['title']}*{ch}{dur}\n\nDownload as:"
+                kb   = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎬 Video",       callback_data=f"dl:{token}:video"),
+                     InlineKeyboardButton("🎵 Audio only",  callback_data=f"dl:{token}:best")],
+                    [InlineKeyboardButton("❌ Cancel",        callback_data=f"no:{token}")],
+                ])
 
     else:  # soundcloud
         if info is None:
@@ -686,7 +717,97 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
     return [], error_type
 
 
-# ── Upload helper ─────────────────────────────────────────────────────────────
+async def _ytdlp_video_download(url: str, out_dir: Path, msg) -> tuple[list[Path], str | None]:
+    """Download a YouTube video (up to 50MB) with audio merged."""
+    out_tmpl = str(out_dir / "%(title)s.%(ext)s")
+    # Best video+audio up to ~720p merged into mp4; cap size to stay under 50MB
+    cmd = [_YTDLP] + _cookie_args() + [
+        "--format", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--add-metadata",
+        "--newline",
+        "--output", out_tmpl,
+    ]
+
+    for attempt, client_args in enumerate(_YT_CLIENT_STRATEGIES):
+        full_cmd = cmd + client_args + [url]
+        logger.info("yt-dlp video attempt %d", attempt + 1)
+        if attempt > 0:
+            try: await msg.edit_text(f"⚠️ Retrying video download (method {attempt + 1}/4)...")
+            except Exception: pass
+
+        proc = await asyncio.create_subprocess_exec(
+            *full_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+
+        attempt_error = None
+        last_edit = asyncio.get_event_loop().time()
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            if not line: continue
+            logger.info("yt-dlp video: %s", line)
+            if _RE_AUTH_ERR.search(line): attempt_error = "auth"
+            elif _RE_DRM_ERR.search(line): attempt_error = "drm"
+            elif _RE_GEO_ERR.search(line): attempt_error = "geo"
+            mp = _RE_PCT.search(line)
+            if mp:
+                pct = min(int(float(mp.group(1))), 100)
+                now = asyncio.get_event_loop().time()
+                if now - last_edit >= 3:
+                    try: await msg.edit_text(f"📥 Downloading video...\n{_bar(pct)} {pct}%")
+                    except Exception: pass
+                    last_edit = now
+
+        await proc.wait()
+
+        files = sorted(p for p in out_dir.rglob("*.mp4") if p.is_file())
+        if not files:
+            files = sorted(p for p in out_dir.rglob("*") if p.is_file() and p.suffix.lower()
+                           in {".mp4", ".mkv", ".webm", ".mov"})
+        if files:
+            # Skip files >49MB
+            files = [f for f in files if f.stat().st_size <= MAX_FILE_BYTES]
+            if files:
+                return files, None
+
+        if attempt_error in ("drm", "geo"):
+            break
+
+    return [], attempt_error or "auth"
+
+
+# ── Upload helpers ────────────────────────────────────────────────────────────
+
+async def _send_video(bot, chat_id: int, f: Path, reply_to: int | None = None) -> bool:
+    """Upload a video file to Telegram. Returns True on success."""
+    size = f.stat().st_size
+    if size > MAX_FILE_BYTES:
+        logger.warning("Skipping video %s: %d MB", f.name, size >> 20)
+        try:
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Video is {size >> 20} MB — too large for Telegram (50 MB limit).",
+                reply_to_message_id=reply_to)
+        except Exception:
+            pass
+        return False
+    try:
+        with open(f, "rb") as fh:
+            await bot.send_video(
+                chat_id,
+                fh,
+                caption=f.stem[:200],
+                supports_streaming=True,
+                reply_to_message_id=reply_to,
+                read_timeout=300,
+                write_timeout=300,
+                connect_timeout=30,
+            )
+        return True
+    except Exception as e:
+        logger.error("send_video failed for %s: %s", f.name, e)
+        return False
+
 
 async def _send_audio(bot, chat_id: int, f: Path, reply_to: int | None = None) -> bool:
     """Upload one mp3 to Telegram. Returns True on success."""
@@ -707,7 +828,7 @@ async def _send_audio(bot, chat_id: int, f: Path, reply_to: int | None = None) -
                 chat_id=chat_id, audio=fh,
                 title=f.stem[:64], filename=f.name,
                 reply_to_message_id=reply_to,
-                read_timeout=120, write_timeout=120)
+                read_timeout=300, write_timeout=300, connect_timeout=30)
         return True
     except Exception as e:
         logger.error("Upload failed %s: %s", f.name, e)
@@ -761,6 +882,9 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
                         prefetched_songs=ctx.get("songs") or None,
                     )
                 err = None if files else "auth"
+            elif quality == "video":
+                out_dir.mkdir(exist_ok=True)
+                files, err = await _ytdlp_video_download(url, out_dir, msg)
             else:
                 out_dir.mkdir(exist_ok=True)
                 files, err = await _ytdlp_download(
@@ -794,7 +918,12 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
 
             sent = 0
             for f in files:
-                if await _send_audio(bot, chat_id, f, reply_to=reply_to):
+                is_video_file = f.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi"}
+                if is_video_file:
+                    ok = await _send_video(bot, chat_id, f, reply_to=reply_to)
+                else:
+                    ok = await _send_audio(bot, chat_id, f, reply_to=reply_to)
+                if ok:
                     sent += 1
                 await asyncio.sleep(0.4)  # avoid Telegram flood limits
 
@@ -840,13 +969,14 @@ async def cmd_start(update: Update, _) -> None:
 async def handle_message(update: Update, context) -> None:
     text = update.message.text.strip()
 
-    is_sp = bool(_RE_SPOTIFY.search(text))
-    is_yt = bool(_RE_YOUTUBE.search(text))
-    is_sc = bool(_RE_SOUNDCLOUD.search(text))
+    is_sp  = bool(_RE_SPOTIFY.search(text))
+    is_ytm = bool(_RE_YT_MUSIC.search(text))
+    is_yt  = bool(_RE_YOUTUBE.search(text)) or is_ytm
+    is_sc  = bool(_RE_SOUNDCLOUD.search(text))
 
     if not (is_sp or is_yt or is_sc):
         await update.message.reply_text(
-            "Please send a Spotify, YouTube, or SoundCloud URL.")
+            "Please send a Spotify, YouTube, YouTube Music, or SoundCloud URL.")
         return
 
     msg = await update.message.reply_text("🔍 Looking up...")
