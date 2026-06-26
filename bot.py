@@ -53,6 +53,14 @@ AUDIO_FORMAT = os.environ.get("AUDIO_FORMAT", "m4a").strip().lower()
 YTDLP_PROXY  = os.environ.get("YTDLP_PROXY", "").strip()
 SPOTDL_PROXY = os.environ.get("SPOTDL_PROXY", "").strip()
 
+YOUTUBE_EMAIL    = os.environ.get("YOUTUBE_EMAIL", "").strip()
+YOUTUBE_PASSWORD = os.environ.get("YOUTUBE_PASSWORD", "").strip()
+
+# Auto-refresh cookies when they're older than this (6 days)
+_COOKIE_MAX_AGE = 6 * 24 * 3600
+_cookie_refresh_lock = asyncio.Lock()
+_cookie_refresh_task: asyncio.Task | None = None
+
 
 # ── Binary / path resolution ──────────────────────────────────────────────────
 def _find_bin(name: str) -> str:
@@ -131,6 +139,35 @@ def _cookie_args() -> list[str]:
 
 def _spotdl_proxy_args() -> list[str]:
     return ["--proxy", SPOTDL_PROXY] if SPOTDL_PROXY else []
+
+
+def _cookies_age() -> float:
+    """Returns age of cookies.txt in seconds, or infinity if missing."""
+    if not os.path.isfile(_COOKIES):
+        return float("inf")
+    return time.time() - os.path.getmtime(_COOKIES)
+
+
+async def _auto_refresh_cookies() -> None:
+    """Refresh YouTube cookies in the background using refresh_cookies.py."""
+    global _cookie_refresh_task
+    async with _cookie_refresh_lock:
+        if _cookies_age() < _COOKIE_MAX_AGE:
+            return
+        if not YOUTUBE_EMAIL or not YOUTUBE_PASSWORD:
+            logger.info("No YOUTUBE_EMAIL set — skipping auto cookie refresh")
+            return
+
+        logger.info("Cookies are stale or missing — starting auto-refresh...")
+        try:
+            import refresh_cookies  # noqa: PLC0415
+            ok = await refresh_cookies.refresh()
+            if ok:
+                logger.info("Cookie refresh succeeded")
+            else:
+                logger.warning("Cookie refresh failed — downloads may be limited")
+        except Exception as e:
+            logger.error("Cookie refresh error: %s", e)
 
 
 # yt-dlp attempt strategies (tried in order until one succeeds):
@@ -701,6 +738,10 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
         except Exception:
             pass
 
+    # Auto-refresh cookies before download if stale (non-blocking for other logic)
+    if _cookies_age() > _COOKIE_MAX_AGE:
+        asyncio.create_task(_auto_refresh_cookies())
+
     async with _sem:
         _active += 1
         tmpdir = tempfile.mkdtemp(prefix="bot_")
@@ -890,19 +931,28 @@ async def error_handler(update, context) -> None:
     logger.error("Unhandled error: %s", context.error, exc_info=True)
 
 
+async def _post_init(app) -> None:
+    """Run after bot connects — kick off cookie refresh in background."""
+    if YOUTUBE_EMAIL and YOUTUBE_PASSWORD and _cookies_age() > _COOKIE_MAX_AGE:
+        logger.info("Scheduling background cookie refresh on startup...")
+        asyncio.create_task(_auto_refresh_cookies())
+
+
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set.")
     app = (Application.builder()
            .token(TOKEN)
            .concurrent_updates(True)
+           .post_init(_post_init)
            .build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_cookies_file))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
-    logger.info("Bot running — MAX_CONCURRENT=%d", MAX_CONCURRENT)
+    logger.info("Bot running — MAX_CONCURRENT=%d  cookie_email=%s",
+                MAX_CONCURRENT, YOUTUBE_EMAIL or "not set")
     app.run_polling()
 
 

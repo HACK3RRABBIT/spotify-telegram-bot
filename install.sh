@@ -153,7 +153,11 @@ info "Installing Python packages..."
     python-dotenv \
     spotdl \
     httpx \
-    bgutil-ytdlp-pot-provider
+    bgutil-ytdlp-pot-provider \
+    playwright
+
+info "Installing Playwright Chromium browser..."
+"$CONDA_BASE/envs/$CONDA_ENV/bin/playwright" install chromium --with-deps 2>&1 | tail -5
 
 # ── 5. bgutil PO-token provider (Node.js server) ─────────────────────────────
 # bgutil generates YouTube Proof-of-Origin tokens that satisfy bot-detection
@@ -241,6 +245,37 @@ if [[ ! -f .env ]]; then
     fi
 else
     info ".env already exists."
+fi
+
+# Add YouTube auto-login credentials (optional but recommended)
+if ! grep -q "YOUTUBE_EMAIL" .env; then
+    echo ""
+    warn "============================================="
+    warn "  Optional: YouTube Auto-Login"
+    warn "  Use a DEDICATED Google account (no 2FA)."
+    warn "  This lets the bot refresh cookies"
+    warn "  automatically — no manual uploads needed."
+    warn "============================================="
+    read -rp "Enter YouTube/Google email (leave blank to skip): " YT_EMAIL
+    if [[ -n "$YT_EMAIL" ]]; then
+        read -rsp "Enter password: " YT_PASS
+        echo ""
+        {
+            echo ""
+            echo "# YouTube auto-login (used to refresh cookies automatically)"
+            echo "YOUTUBE_EMAIL=$YT_EMAIL"
+            echo "YOUTUBE_PASSWORD=$YT_PASS"
+        } >> .env
+        info "YouTube credentials saved to .env"
+    else
+        {
+            echo ""
+            echo "# YouTube auto-login (optional — leave blank to disable)"
+            echo "YOUTUBE_EMAIL="
+            echo "YOUTUBE_PASSWORD="
+        } >> .env
+        warn "Skipped. You can add YOUTUBE_EMAIL / YOUTUBE_PASSWORD to .env later."
+    fi
 fi
 
 # Add proxy config if not already present
