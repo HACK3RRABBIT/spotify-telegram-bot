@@ -41,18 +41,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_EDIT_INTERVAL = 3  # seconds between Telegram edits
+_EDIT_INTERVAL = 3  # seconds between Telegram message edits
+
+# yt-dlp progress line:  "[download]  45.2% of 4.50MiB at 1.23MiB/s ETA 00:02"
+_RE_PERCENT   = re.compile(r"\[download\]\s+([\d.]+)%")
+# spotdl DEBUG: "Downloading  Artist - Title"  (1-3 spaces)
+_RE_DL_START  = re.compile(r"^Downloading\s{1,3}(.+)$")
+# spotdl DEBUG: "Downloaded  Artist - Title"
+_RE_DL_DONE   = re.compile(r"^Downloaded\s{1,3}(.+)$")
+# spotdl skipping already-cached song
+_RE_SKIP      = re.compile(r"Skipping", re.IGNORECASE)
+# any failure
+_RE_FAIL      = re.compile(r"Failed|Error", re.IGNORECASE)
+
+
+def _bar(pct: int) -> str:
+    filled = pct // 10
+    return "▓" * filled + "░" * (10 - filled)
 
 
 async def _run_spotdl(
     cmd: list[str], msg, timeout: int = 600
 ) -> tuple[int, str, list[str]]:
-    """
-    Run spotdl, stream output line by line, update Telegram message with:
-      - track name as soon as spotdl finds it
-      - real download percentage from yt-dlp
-    Returns (returncode, full_output, list_of_sent_titles).
-    """
+    """Stream spotdl output and push live progress to Telegram."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -60,26 +71,14 @@ async def _run_spotdl(
     )
 
     all_lines: list[str] = []
-    sent_titles: list[str] = []
-    last_edit_time = asyncio.get_event_loop().time()
+    downloaded_titles: list[str] = []
+    last_edit = asyncio.get_event_loop().time()
 
-    # Mutable state updated by the reader coroutine
     state = {
-        "current_track": "",   # name of track being downloaded right now
-        "percent": None,       # int 0-100 or None
-        "done_count": 0,
-        "fail_count": 0,
-        "status_text": "Looking up track...",
+        "text": "Looking up track...",
+        "track": "",
+        "pct": None,
     }
-
-    # Regex to catch yt-dlp progress: "[download]  45.2% of 4.50MiB ..."
-    _YTDLP_PCT = re.compile(r"\[download\]\s+([\d.]+)%")
-    # spotdl simple-tui: "Downloading  Artist - Title"
-    _DOWNLOADING = re.compile(r"^Downloading\s{1,3}(.+)$")
-    # spotdl simple-tui: "Downloaded  Artist - Title"
-    _DOWNLOADED  = re.compile(r"^Downloaded\s{1,3}(.+)$")
-    # "Failed to download ..."
-    _FAILED      = re.compile(r"Failed", re.IGNORECASE)
 
     async def read_lines():
         async for raw in proc.stdout:
@@ -87,41 +86,36 @@ async def _run_spotdl(
             if not line:
                 continue
             all_lines.append(line)
-            logger.info(f"spotdl: {line}")
+            logger.info("spotdl: %s", line)
 
-            m = _DOWNLOADING.match(line)
+            m = _RE_DL_START.match(line)
             if m:
-                state["current_track"] = m.group(1).strip()
-                state["percent"] = 0
-                state["status_text"] = (
-                    f'Found: *{state["current_track"]}*\nDownloading... 0%'
+                state["track"] = m.group(1).strip()
+                state["pct"] = 0
+                state["text"] = f"Found: *{state['track']}*\nDownloading... 0%  {_bar(0)}"
+                continue
+
+            m = _RE_PERCENT.search(line)
+            if m and state["track"]:
+                pct = min(int(float(m.group(1))), 100)
+                state["pct"] = pct
+                state["text"] = (
+                    f"Downloading: *{state['track']}*\n"
+                    f"{pct}%  {_bar(pct)}"
                 )
                 continue
 
-            m = _YTDLP_PCT.search(line)
-            if m and state["current_track"]:
-                pct = int(float(m.group(1)))
-                state["percent"] = pct
-                state["status_text"] = (
-                    f'Downloading: *{state["current_track"]}*\n'
-                    f'Progress: {pct}%  {"▓" * (pct // 10)}{"░" * (10 - pct // 10)}'
-                )
-                continue
-
-            m = _DOWNLOADED.match(line)
+            m = _RE_DL_DONE.match(line)
             if m:
                 title = m.group(1).strip()
-                sent_titles.append(title)
-                state["done_count"] += 1
-                state["percent"] = 100
-                state["status_text"] = (
-                    f'✓ Downloaded: *{title}*\nUploading...'
-                )
+                downloaded_titles.append(title)
+                state["pct"] = 100
+                state["text"] = f"✓ *{title}*\nUploading..."
+                state["track"] = ""
                 continue
 
-            if _FAILED.search(line):
-                state["fail_count"] += 1
-                state["status_text"] = f'⚠️ Failed: `{line[:100]}`'
+            if _RE_FAIL.search(line):
+                state["text"] = f"⚠️ `{line[:120]}`"
 
     reader = asyncio.create_task(read_lines())
     deadline = asyncio.get_event_loop().time() + timeout
@@ -131,20 +125,20 @@ async def _run_spotdl(
         if now >= deadline:
             proc.kill()
             await reader
-            return -1, "\n".join(all_lines), sent_titles
+            return -1, "\n".join(all_lines), downloaded_titles
 
-        if now - last_edit_time >= _EDIT_INTERVAL:
+        if now - last_edit >= _EDIT_INTERVAL:
             try:
-                await msg.edit_text(state["status_text"], parse_mode="Markdown")
+                await msg.edit_text(state["text"], parse_mode="Markdown")
             except Exception:
                 pass
-            last_edit_time = now
+            last_edit = now
 
         await asyncio.sleep(1)
 
     await reader
     rc = await proc.wait()
-    return rc, "\n".join(all_lines), sent_titles
+    return rc, "\n".join(all_lines), downloaded_titles
 
 
 async def start(update: Update, _) -> None:
@@ -153,8 +147,7 @@ async def start(update: Update, _) -> None:
         "Supported:\n"
         "  • Spotify — track, album, playlist, artist\n"
         "  • YouTube — youtube.com or youtu.be\n"
-        "  • SoundCloud — soundcloud.com\n\n"
-        "Tip: download speed depends on the server's internet connection."
+        "  • SoundCloud — soundcloud.com"
     )
 
 
@@ -175,18 +168,18 @@ async def handle_message(update: Update, _) -> None:
         cmd = [
             _SPOTDL_PATH,
             "--output", str(out_dir) + "/{title}",
-            "--simple-tui",
-            "--log-level", "DEBUG",
+            "--overwrite",          # always re-download; ignore spotdl's song cache
+            "--log-level", "DEBUG", # needed to get yt-dlp [download] XX% lines
             "--print-errors",
             url,
         ]
-        logger.info(f"Running: {' '.join(cmd)}")
+        logger.info("Running: %s", " ".join(cmd))
 
         try:
-            rc, output, sent_titles = await _run_spotdl(cmd, msg)
+            rc, output, downloaded_titles = await _run_spotdl(cmd, msg)
         except Exception as e:
             logger.exception("Subprocess error")
-            await msg.edit_text(f"Error starting download: {e}")
+            await msg.edit_text(f"Error: {e}")
             return
 
         if rc == -1:
@@ -197,9 +190,9 @@ async def handle_message(update: Update, _) -> None:
 
         if not files:
             tail = "\n".join(output.splitlines()[-15:]) if output else "(no output)"
-            logger.warning(f"spotdl exited {rc} but no files found.\n{output}")
+            logger.warning("spotdl exited %d but no files found.", rc)
             await msg.edit_text(
-                f"No files were downloaded (exit {rc}).\n\nLast output:\n`{tail[:400]}`",
+                f"No files were downloaded (exit {rc}).\n\n`{tail[:400]}`",
                 parse_mode="Markdown",
             )
             return
@@ -213,32 +206,29 @@ async def handle_message(update: Update, _) -> None:
                         filename=f.name,
                     )
             finally:
+                # Delete immediately after upload — don't wait for tmpdir cleanup
                 try:
                     f.unlink()
                 except OSError:
                     pass
 
-        # Final message: just the track name(s), no generic "Sent N tracks"
-        if sent_titles:
-            if len(sent_titles) == 1:
-                await msg.edit_text(f"✓ *{sent_titles[0]}*", parse_mode="Markdown")
-            else:
-                names = "\n".join(f"• {t}" for t in sent_titles)
-                await msg.edit_text(f"✓ Sent {len(sent_titles)} tracks:\n{names}", parse_mode="Markdown")
+        # Final status: just the track name(s)
+        titles = downloaded_titles or [f.stem for f in files]
+        if len(titles) == 1:
+            await msg.edit_text(f"✓ *{titles[0]}*", parse_mode="Markdown")
         else:
-            # Fallback: use filenames if titles weren't captured from output
-            names = "\n".join(f"• {f.stem}" for f in files)
-            if len(files) == 1:
-                await msg.edit_text(f"✓ *{files[0].stem}*", parse_mode="Markdown")
-            else:
-                await msg.edit_text(f"✓ Sent {len(files)} tracks:\n{names}", parse_mode="Markdown")
+            bullet = "\n".join(f"• {t}" for t in titles)
+            await msg.edit_text(
+                f"✓ {len(titles)} tracks sent:\n{bullet}", parse_mode="Markdown"
+            )
 
     finally:
+        # Always wipe the temp dir (files already unlinked, but dir must go too)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def error_handler(update: Update, context) -> None:
-    logger.error(f"Update {update} caused error {context.error}")
+    logger.error("Update %s caused error %s", update, context.error)
 
 
 def main():
