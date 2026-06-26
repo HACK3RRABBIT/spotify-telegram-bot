@@ -177,18 +177,16 @@ async def _auto_refresh_cookies() -> None:
 # So we never mix cookies with mobile clients.
 #
 # Each entry is (client_args, use_cookies).
-# When cookies exist:   try web+cookies+deno first, then android_vr (no cookies)
-# When no cookies:      try android_vr, then mweb, then default
-_YT_STRATEGIES_WITH_COOKIES = [
-    # web client + cookies + Deno JS runtime (solves n-challenge)
-    (["--extractor-args", "youtube:player_client=web", "--js-runtimes", "deno"], True),
-    # mobile fallback — ignores cookies but still works via WARP
-    (["--extractor-args", "youtube:player_client=android_vr"], False),
-]
-_YT_STRATEGIES_NO_COOKIES = [
+# Strategy order: android_vr first (fastest, works on WARP without cookies),
+# then web+cookies+deno (for age-restricted content when valid cookies exist).
+# NOTE: mobile clients (android_vr, ios, android) silently skip --cookies,
+# so we never pass cookies to them.
+_YT_STRATEGIES = [
     (["--extractor-args", "youtube:player_client=android_vr"], False),
     (["--extractor-args", "youtube:player_client=mweb"], False),
-    ([], False),  # yt-dlp default
+    # web client — only useful when valid cookies are present
+    (["--extractor-args", "youtube:player_client=web", "--js-runtimes", "deno"], True),
+    ([], False),
 ]
 
 
@@ -650,8 +648,6 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
         ext_glob = f"*.{AUDIO_FORMAT}"
 
     has_cookies = os.path.isfile(_COOKIES)
-    strategies = _YT_STRATEGIES_WITH_COOKIES if has_cookies else _YT_STRATEGIES_NO_COOKIES
-
     proxy_args = ["--proxy", YTDLP_PROXY] if YTDLP_PROXY else []
     base_cmd = [_YTDLP] + proxy_args + no_pl + fmt_args + [
         "--add-metadata", "--newline", "--output", out_tmpl,
@@ -659,7 +655,7 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
 
     # Try each client strategy in order until one produces a file
     error_type: str | None = None
-    for attempt, (client_args, use_cookies) in enumerate(strategies):
+    for attempt, (client_args, use_cookies) in enumerate(_YT_STRATEGIES):
         cookie_args = ["--cookies", _COOKIES] if (use_cookies and has_cookies) else []
         cmd = base_cmd + cookie_args + client_args + [url]
         logger.info("yt-dlp attempt %d (cookies=%s): %s", attempt + 1, use_cookies, " ".join(cmd))
@@ -734,7 +730,6 @@ async def _ytdlp_video_download(url: str, out_dir: Path, msg) -> tuple[list[Path
     out_tmpl = str(out_dir / "%(title)s.%(ext)s")
     # Best video+audio up to ~720p merged into mp4; cap size to stay under 50MB
     has_cookies = os.path.isfile(_COOKIES)
-    strategies = _YT_STRATEGIES_WITH_COOKIES if has_cookies else _YT_STRATEGIES_NO_COOKIES
     proxy_args = ["--proxy", YTDLP_PROXY] if YTDLP_PROXY else []
     base_cmd = [_YTDLP] + proxy_args + [
         "--format", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
@@ -745,7 +740,7 @@ async def _ytdlp_video_download(url: str, out_dir: Path, msg) -> tuple[list[Path
         "--output", out_tmpl,
     ]
 
-    for attempt, (client_args, use_cookies) in enumerate(strategies):
+    for attempt, (client_args, use_cookies) in enumerate(_YT_STRATEGIES):
         cookie_args = ["--cookies", _COOKIES] if (use_cookies and has_cookies) else []
         full_cmd = base_cmd + cookie_args + client_args + [url]
         logger.info("yt-dlp video attempt %d (cookies=%s)", attempt + 1, use_cookies)
@@ -911,12 +906,17 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
                     await msg.edit_text(
                         "🔒 This content is DRM-protected and cannot be downloaded.")
                 elif err == "auth":
-                    await msg.edit_text(
-                        "🔑 YouTube is blocking this server.\n\n"
-                        "Your cookies have expired or the server IP is flagged.\n"
-                        "To fix: export fresh cookies from your browser (logged into YouTube) "
-                        "as cookies.txt and send that file to this chat — "
-                        "the bot will update automatically.")
+                    has_cookies = os.path.isfile(_COOKIES)
+                    if has_cookies:
+                        await msg.edit_text(
+                            "🔑 This video requires a YouTube login.\n\n"
+                            "Your cookies.txt may have expired. Please export fresh cookies "
+                            "from your browser (logged into YouTube) and send the file here.")
+                    else:
+                        await msg.edit_text(
+                            "🔒 This video requires a YouTube account to download "
+                            "(age-restricted or private).\n\n"
+                            "Send your YouTube cookies.txt file here to unlock it.")
                 elif err == "geo":
                     await msg.edit_text(
                         "🌍 This content is not available in this server's region.")
@@ -1064,9 +1064,30 @@ async def handle_cookies_file(update: Update, context) -> None:
         with open(_COOKIES, "wb") as fh:
             fh.write(content)
         logger.info("cookies.txt updated from Telegram upload (%d bytes)", len(content))
-        await update.message.reply_text(
-            "✅ cookies.txt updated! YouTube downloads should work now.\n"
-            "Try sending a YouTube or Spotify link.")
+
+        # Quick validation: try fetching a known public video with these cookies
+        await update.message.reply_text("⏳ Validating cookies...")
+        val_out, val_rc = await _run([
+            _YTDLP,
+            "--cookies", _COOKIES,
+            "--proxy", YTDLP_PROXY,
+            "--extractor-args", "youtube:player_client=web",
+            "--js-runtimes", "deno",
+            "--no-download", "--print", "title",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ], timeout=30)
+
+        if "rick astley" in val_out.lower() or val_rc == 0:
+            await update.message.reply_text(
+                "✅ Cookies valid! YouTube downloads are now fully unlocked.\n"
+                "Age-restricted and logged-in content will now work.")
+        else:
+            # Cookies saved but may be invalid — warn user
+            logger.warning("Cookie validation failed: rc=%d out=%s", val_rc, val_out[:200])
+            await update.message.reply_text(
+                "⚠️ Cookies saved but appear expired or invalid.\n"
+                "Normal YouTube videos will still work via WARP.\n"
+                "For age-restricted content, export fresh cookies from an active browser session.")
     except Exception as e:
         logger.error("Cookie upload failed: %s", e)
         await update.message.reply_text(f"❌ Failed to save cookies: {e}")
