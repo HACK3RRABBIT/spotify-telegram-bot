@@ -545,6 +545,8 @@ async def _spotdl_download(url: str, out_dir: Path, msg) -> list[Path]:
     cookie_args = ["--cookie-file", _COOKIES] if os.path.isfile(_COOKIES) else []
     # --threads 2: spotdl default is 4 which saturates a 1-core VPS
     # --format m4a: skip re-encoding, copy AAC stream directly (much faster)
+    # Prefer SoundCloud → YouTube Music → YouTube → Piped (avoids YouTube bot detection)
+    audio_providers = ["soundcloud", "youtube-music", "youtube", "piped"]
     cmd = [
         _SPOTDL, "download", url,
         "--output", str(out_dir / "{title}"),
@@ -552,6 +554,8 @@ async def _spotdl_download(url: str, out_dir: Path, msg) -> list[Path]:
         "--simple-tui",
         "--threads", "2",
         "--format", AUDIO_FORMAT,
+        "--audio", *audio_providers,
+        "--dont-filter-results",
     ] + cookie_args + _spotdl_proxy_args()
     logger.info("spotdl cmd: %s", " ".join(cmd))
 
@@ -618,8 +622,14 @@ async def _spotdl_save_ytdlp(url: str, out_dir: Path, msg, prefetched_songs: lis
             await msg.edit_text(f"📥 Track {i}/{total}\n{title[:60]}")
         except Exception:
             pass
-        new, _ = await _ytdlp_download(f"ytsearch1:{title}", tdir, msg)
-        files.extend(new)
+        # Try SoundCloud first — no bot detection, no auth needed
+        sc, sc_err = await _ytdlp_download(f"scsearch1:{title}", tdir, msg)
+        if sc:
+            files.extend(sc)
+        else:
+            # Fall back to YouTube search
+            yt, _ = await _ytdlp_download(f"ytsearch1:{title}", tdir, msg)
+            files.extend(yt)
 
     return files
 
