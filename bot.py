@@ -126,6 +126,7 @@ async def _fetch_yt_sc_info(url: str) -> dict | None:
 
     stderr is sent to DEVNULL so yt-dlp's cookie-loading messages don't
     corrupt the JSON that comes on stdout.
+    For YouTube, falls back to the public oEmbed API if yt-dlp is blocked.
     """
     proc = await asyncio.create_subprocess_exec(
         *([_YTDLP] + _cookie_args() + ["--flat-playlist", "-J", "--no-warnings", url]),
@@ -136,16 +137,18 @@ async def _fetch_yt_sc_info(url: str) -> dict | None:
         out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
     except asyncio.TimeoutError:
         proc.kill()
-        return None
+        out_bytes = b""
+
     out = out_bytes.decode(errors="replace").strip()
     try:
         d = json.loads(out)
     except Exception:
-        logger.warning("yt-dlp -J parse failed for %s: %r", url, out[:200])
-        return None
+        d = None
+
     if d is None:
-        logger.warning("yt-dlp -J returned null for %s (blocked or unavailable)", url)
-        return None
+        logger.warning("yt-dlp -J failed for %s — trying oEmbed fallback", url)
+        return await _fetch_oembed_fallback(url)
+
     if d.get("_type") == "playlist":
         entries = d.get("entries") or []
         return {"kind": "playlist", "count": len(entries),
@@ -156,6 +159,27 @@ async def _fetch_yt_sc_info(url: str) -> dict | None:
         "duration": _dur(d.get("duration")),
         "channel": d.get("uploader") or d.get("channel", ""),
     }
+
+
+async def _fetch_oembed_fallback(url: str) -> dict | None:
+    """YouTube public oEmbed API — works even when server IP is blocked for downloads."""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get("https://www.youtube.com/oembed",
+                                 params={"url": url, "format": "json"})
+            if r.status_code != 200:
+                return None
+            d = r.json()
+        return {
+            "kind": "single", "count": 1,
+            "title": d.get("title", "YouTube Video"),
+            "channel": d.get("author_name", ""),
+            "duration": "",
+            "blocked": True,
+        }
+    except Exception as e:
+        logger.warning("oEmbed fallback also failed for %s: %s", url, e)
+        return None
 
 
 _RE_SONGS = re.compile(r"(\d+)\s+Song", re.I)
@@ -229,9 +253,11 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
                 InlineKeyboardButton("❌ Cancel",        callback_data=f"no:{token}"),
             ]])
         else:
-            ch  = f"\n👤 {info['channel']}" if info.get("channel") else ""
-            dur = f"  ⏱ {info['duration']}"  if info.get("duration") else ""
-            text = f"▶️ {info['title']}{ch}{dur}\n\nChoose audio quality:"
+            ch      = f"\n👤 {info['channel']}" if info.get("channel") else ""
+            dur     = f"  ⏱ {info['duration']}"  if info.get("duration") else ""
+            blocked = info.get("blocked", False)
+            warn    = "\n\n⚠️ Server IP may be blocked by YouTube.\nDownload might fail — try anyway?" if blocked else "\n\nChoose audio quality:"
+            text = f"▶️ {info['title']}{ch}{dur}{warn}"
             kb   = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔊 Best (320k)",   callback_data=f"dl:{token}:best"),
                  InlineKeyboardButton("🎧 Medium (128k)", callback_data=f"dl:{token}:mid"),
@@ -337,16 +363,22 @@ async def _spotdl_save_ytdlp(url: str, out_dir: Path, msg) -> list[Path]:
             await msg.edit_text(f"📥 Track {i}/{total}\n{title[:60]}")
         except Exception:
             pass
-        new = await _ytdlp_download(f"ytsearch1:{title}", tdir, msg)
+        new, _ = await _ytdlp_download(f"ytsearch1:{title}", tdir, msg)
         files.extend(new)
 
     return files
 
 
+_RE_AUTH_ERR = re.compile(r"Sign in to confirm|LOGIN_REQUIRED|bot detection", re.I)
+_RE_DRM_ERR  = re.compile(r"DRM protected", re.I)
+_RE_GEO_ERR  = re.compile(r"not available in your country|geo.?restricted", re.I)
+
+
 async def _ytdlp_download(url: str, out_dir: Path, msg,
                            quality: str = "best",
-                           is_playlist: bool = False) -> list[Path]:
-    """Download via yt-dlp (YouTube, SoundCloud, or search query)."""
+                           is_playlist: bool = False) -> tuple[list[Path], str | None]:
+    """Download via yt-dlp. Returns (files, error_type) where error_type is
+    'auth', 'drm', 'geo', or None for success."""
     aq       = {"best": "0", "mid": "5", "low": "9"}.get(quality, "0")
     out_tmpl = str(out_dir / (
         "%(playlist_index)02d - %(title)s.%(ext)s" if is_playlist
@@ -368,6 +400,7 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 
     cur = tot = 0
+    error_type: str | None = None
     last_edit = asyncio.get_event_loop().time()
 
     async for raw in proc.stdout:
@@ -375,6 +408,13 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
         if not line:
             continue
         logger.info("yt-dlp: %s", line)
+
+        if _RE_AUTH_ERR.search(line):
+            error_type = "auth"
+        elif _RE_DRM_ERR.search(line):
+            error_type = "drm"
+        elif _RE_GEO_ERR.search(line):
+            error_type = "geo"
 
         mi = _RE_ITEM.search(line)
         if mi:
@@ -394,7 +434,8 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
                 last_edit = now
 
     await proc.wait()
-    return sorted(p for p in out_dir.rglob("*.mp3") if p.is_file())
+    files = sorted(p for p in out_dir.rglob("*.mp3") if p.is_file())
+    return files, (None if files else error_type)
 
 
 # ── Upload helper ─────────────────────────────────────────────────────────────
@@ -456,21 +497,34 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
                 pass
 
             if platform == "spotify":
-                # Try spotdl download directly (handles auth + parallel tracks)
                 (out_dir / "direct").mkdir(parents=True, exist_ok=True)
                 files = await _spotdl_download(url, out_dir / "direct", msg)
                 if not files:
-                    # Fallback: resolve via save, download each via yt-dlp
                     logger.info("spotdl direct returned no files — trying save+yt-dlp fallback")
                     files = await _spotdl_save_ytdlp(url, out_dir / "fallback", msg)
+                err = None if files else "auth"
             else:
                 out_dir.mkdir(exist_ok=True)
-                files = await _ytdlp_download(
+                files, err = await _ytdlp_download(
                     url, out_dir, msg, quality=quality, is_playlist=is_playlist)
 
             if not files:
-                await msg.edit_text(
-                    "❌ Nothing downloaded. The content may not be available.")
+                if err == "drm":
+                    await msg.edit_text(
+                        "🔒 This content is DRM-protected and cannot be downloaded.")
+                elif err == "auth":
+                    await msg.edit_text(
+                        "🔑 YouTube is blocking this server.\n\n"
+                        "Your cookies have expired or the server IP is flagged.\n"
+                        "To fix: export fresh cookies from your browser (logged into YouTube) "
+                        "as cookies.txt and send that file to this chat — "
+                        "the bot will update automatically.")
+                elif err == "geo":
+                    await msg.edit_text(
+                        "🌍 This content is not available in this server's region.")
+                else:
+                    await msg.edit_text(
+                        "❌ Nothing downloaded. The content may not be available.")
                 return
 
             total = len(files)
@@ -518,7 +572,10 @@ async def cmd_start(update: Update, _) -> None:
         "• Spotify — track, album, playlist, artist\n"
         "• YouTube — video, playlist, YouTube Music\n"
         "• SoundCloud — track, set\n\n"
-        "For YouTube videos you can also choose the audio quality before downloading."
+        "For YouTube videos you can choose audio quality (Best / Medium / Low).\n\n"
+        "If YouTube downloads fail, export your browser cookies from youtube.com "
+        "(use the 'Get cookies.txt LOCALLY' extension) and send the .txt file here — "
+        "the bot updates automatically."
     )
 
 
@@ -575,6 +632,39 @@ async def handle_callback(update: Update, context) -> None:
     asyncio.create_task(_run_download(context.bot, chat_id, msg, ctx))
 
 
+async def handle_cookies_file(update: Update, context) -> None:
+    """Accept a cookies.txt file upload and save it for YouTube auth."""
+    doc = update.message.document
+    if not doc:
+        return
+    if not (doc.file_name or "").lower().endswith(".txt"):
+        await update.message.reply_text(
+            "Please send a .txt file (Netscape format cookies exported from your browser).")
+        return
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        content = bytes()
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(f.file_path)
+            r.raise_for_status()
+            content = r.content
+        text = content.decode(errors="replace")
+        if "youtube.com" not in text.lower() and "# Netscape HTTP Cookie" not in text:
+            await update.message.reply_text(
+                "⚠️ This doesn't look like a YouTube cookies file. "
+                "Export it from youtube.com using a browser extension like 'Get cookies.txt LOCALLY'.")
+            return
+        with open(_COOKIES, "wb") as fh:
+            fh.write(content)
+        logger.info("cookies.txt updated from Telegram upload (%d bytes)", len(content))
+        await update.message.reply_text(
+            "✅ cookies.txt updated! YouTube downloads should work now.\n"
+            "Try sending a YouTube or Spotify link.")
+    except Exception as e:
+        logger.error("Cookie upload failed: %s", e)
+        await update.message.reply_text(f"❌ Failed to save cookies: {e}")
+
+
 async def error_handler(update, context) -> None:
     logger.error("Unhandled error: %s", context.error, exc_info=True)
 
@@ -588,6 +678,7 @@ def main() -> None:
            .build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_cookies_file))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
     logger.info("Bot running — MAX_CONCURRENT=%d", MAX_CONCURRENT)
