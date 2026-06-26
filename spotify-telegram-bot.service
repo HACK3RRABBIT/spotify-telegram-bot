@@ -13,5 +13,11 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
+# Resource limits — safe for 1-core 1GB VPS
+# Prevents OOM from runaway downloads
+MemoryMax=700M
+MemorySwapMax=200M
+CPUQuota=95%
+
 [Install]
 WantedBy=multi-user.target

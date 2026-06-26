@@ -40,17 +40,17 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TOKEN          = os.environ.get("TELEGRAM_BOT_TOKEN")
-MAX_CONCURRENT = 3          # simultaneous downloads
+# On a 1-core/1GB VPS keep this at 1; raise on beefier machines
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "1"))
 MAX_FILE_BYTES = 49 << 20  # 49 MB — Telegram bot upload limit
 CONFIRM_TTL    = 300        # seconds a confirm button stays active
 
-# Optional residential proxy to bypass YouTube's server IP block.
-# Set YTDLP_PROXY in .env to a proxy URL, e.g.:
-#   YTDLP_PROXY=http://user:pass@proxy.webshare.io:80
-#   YTDLP_PROXY=socks5://user:pass@gate.smartproxy.com:7000
-# Leave unset to connect directly (YouTube may block the server IP).
+# Audio format sent to users.
+# "m4a"  — fastest: no re-encoding, copies YouTube's AAC stream directly
+# "mp3"  — universal but requires ffmpeg CPU re-encode (slower on 1-core VPS)
+AUDIO_FORMAT = os.environ.get("AUDIO_FORMAT", "m4a").strip().lower()
+
 YTDLP_PROXY  = os.environ.get("YTDLP_PROXY", "").strip()
-# spotdl only accepts HTTP/HTTPS proxies; privoxy bridges HTTP→WARP SOCKS5
 SPOTDL_PROXY = os.environ.get("SPOTDL_PROXY", "").strip()
 
 
@@ -436,11 +436,15 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
 async def _spotdl_download(url: str, out_dir: Path, msg) -> list[Path]:
     """Download via spotdl — handles Spotify natively with full parallelism."""
     cookie_args = ["--cookie-file", _COOKIES] if os.path.isfile(_COOKIES) else []
+    # --threads 2: spotdl default is 4 which saturates a 1-core VPS
+    # --format m4a: skip re-encoding, copy AAC stream directly (much faster)
     cmd = [
         _SPOTDL, "download", url,
         "--output", str(out_dir / "{title}"),
         "--overwrite", "force",
         "--simple-tui",
+        "--threads", "2",
+        "--format", AUDIO_FORMAT,
     ] + cookie_args + _spotdl_proxy_args()
     logger.info("spotdl cmd: %s", " ".join(cmd))
 
@@ -472,7 +476,7 @@ async def _spotdl_download(url: str, out_dir: Path, msg) -> list[Path]:
                 last_edit = now
 
     await proc.wait()
-    return sorted(p for p in out_dir.rglob("*.mp3") if p.is_file())
+    return sorted(p for p in out_dir.rglob(f"*.{AUDIO_FORMAT}") if p.is_file())
 
 
 async def _spotdl_save_ytdlp(url: str, out_dir: Path, msg, prefetched_songs: list | None = None) -> list[Path]:
@@ -523,17 +527,34 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
                            is_playlist: bool = False) -> tuple[list[Path], str | None]:
     """Download via yt-dlp. Returns (files, error_type) where error_type is
     'auth', 'drm', 'geo', or None for success."""
-    aq       = {"best": "0", "mid": "5", "low": "9"}.get(quality, "0")
     out_tmpl = str(out_dir / (
         "%(playlist_index)02d - %(title)s.%(ext)s" if is_playlist
         else "%(title)s.%(ext)s"))
     no_pl = [] if is_playlist else ["--no-playlist"]
 
-    cmd = [_YTDLP] + _cookie_args() + no_pl + [
-        "--format", "bestaudio/best",
-        "--extract-audio", "--audio-format", "mp3",
-        "--audio-quality", aq,
-        "--embed-thumbnail", "--add-metadata",
+    # Format strategy (ordered by preference):
+    #   m4a  — YouTube serves AAC in m4a; no re-encoding needed, fastest
+    #   webm — YouTube's opus stream; also no re-encoding needed
+    #   mp3  — fallback: requires ffmpeg re-encode, slow on 1-core VPS
+    if AUDIO_FORMAT == "mp3":
+        aq = {"best": "0", "mid": "5", "low": "9"}.get(quality, "0")
+        fmt_args = [
+            "--format", "bestaudio/best",
+            "--extract-audio", "--audio-format", "mp3", "--audio-quality", aq,
+        ]
+        ext_glob = "*.mp3"
+    else:
+        # For quality choices just pick different bitrate tiers via format selector
+        q_fmt = {
+            "best": f"bestaudio[ext={AUDIO_FORMAT}]/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+            "mid":  "bestaudio[abr<=128]/bestaudio",
+            "low":  "bestaudio[abr<=64]/bestaudio",
+        }.get(quality, f"bestaudio[ext={AUDIO_FORMAT}]/bestaudio")
+        fmt_args = ["--format", q_fmt]
+        ext_glob = f"*.{AUDIO_FORMAT}"
+
+    cmd = [_YTDLP] + _cookie_args() + no_pl + fmt_args + [
+        "--add-metadata",
         "--newline",
         "--output", out_tmpl,
         url,
@@ -578,7 +599,10 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
                 last_edit = now
 
     await proc.wait()
-    files = sorted(p for p in out_dir.rglob("*.mp3") if p.is_file())
+    files = sorted(p for p in out_dir.rglob(ext_glob) if p.is_file())
+    if not files:  # pick up any audio file if format didn't match exactly
+        files = sorted(p for p in out_dir.rglob("*") if p.is_file() and p.suffix in
+                       {".mp3", ".m4a", ".webm", ".opus", ".ogg", ".flac", ".wav"})
     return files, (None if files else error_type)
 
 
