@@ -15,6 +15,6 @@ jobs:
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            git -C /opt/spotify-telegram-bot pull
+            git -C /opt/spotify-telegram-bot pull 2>/dev/null || true
             systemctl restart spotify-telegram-bot
-            systemctl is-active spotify-telegram-bot
+            systemctl is-active --quiet spotify-telegram-bot && echo "Bot is running" || exit 1
