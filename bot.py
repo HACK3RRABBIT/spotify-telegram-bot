@@ -187,12 +187,12 @@ async def _auto_refresh_cookies() -> None:
 # NOTE: mobile clients (android_vr, ios, android) silently skip --cookies,
 # so we never pass cookies to them.
 _YT_STRATEGIES = [
-    # 1. Chrome impersonation via curl-cffi (metube-style, best bot bypass)
-    (["--impersonate", "chrome"], False),
-    # 2. android_vr API — no cookies, no JS runtime needed, reliable on WARP
-    (["--extractor-args", "youtube:player_client=android_vr"], False),
-    # 3. web + valid cookies + Deno — for age-restricted / private content
+    # 1. web + cookies + Deno — handles age-restricted, logged-in content
     (["--extractor-args", "youtube:player_client=web", "--js-runtimes", "deno"], True),
+    # 2. Chrome impersonation via curl-cffi (metube-style, best bot bypass)
+    (["--impersonate", "chrome"], False),
+    # 3. android_vr API — no cookies, no JS runtime needed, reliable on WARP
+    (["--extractor-args", "youtube:player_client=android_vr"], False),
     # 4. mweb fallback
     (["--extractor-args", "youtube:player_client=mweb"], False),
 ]
@@ -667,7 +667,8 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
 
     has_cookies = os.path.isfile(_COOKIES)
     proxy_args = ["--proxy", YTDLP_PROXY] if YTDLP_PROXY else []
-    base_cmd = [_YTDLP] + proxy_args + no_pl + fmt_args + [
+    ignore_err = ["--ignore-errors"] if is_playlist else []
+    base_cmd = [_YTDLP] + proxy_args + no_pl + ignore_err + fmt_args + [
         "--add-metadata", "--newline", "--output", out_tmpl,
     ]
 

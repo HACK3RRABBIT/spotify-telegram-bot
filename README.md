@@ -1,6 +1,6 @@
-# Music Downloader Telegram Bot
+# Media Downloader Telegram Bot
 
-A Telegram bot that downloads music from Spotify, YouTube, and SoundCloud and sends the audio files directly to you.
+A Telegram bot that downloads music and video from Spotify, YouTube, and SoundCloud and sends the files directly to you.
 
 Send a link, see track details, choose to download (or cancel). YouTube links offer quality selection. Playlists download per-track with progress updates.
 
