@@ -4,8 +4,7 @@ Telegram bot that downloads Spotify / YouTube / SoundCloud tracks.
 
 Architecture:
   1. spotdl save  → fetch Spotify metadata (name, artist) — no download
-  2. yt-dlp       → search YouTube Music and download directly
-     (bypasses spotdl's yt-dlp integration which fails on server IPs)
+  2. yt-dlp       → search YouTube and download, authenticated via cookies.txt
 """
 
 import json
@@ -46,6 +45,10 @@ _YTDLP_PATH  = os.path.join(_CONDA_BIN, "yt-dlp")
 if not os.path.isfile(_YTDLP_PATH):
     _YTDLP_PATH = "yt-dlp"
 
+# Netscape-format cookies exported from a browser logged into YouTube.
+# Without this the server IP will be blocked by YouTube's bot detection.
+_COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO, stream=sys.stdout,
@@ -59,6 +62,27 @@ _RE_PCT = re.compile(r"\[download\]\s+([\d.]+)%")
 def _bar(pct: int) -> str:
     filled = pct // 10
     return "▓" * filled + "░" * (10 - filled)
+
+
+def _ytdlp_base_cmd(out_dir: Path) -> list[str]:
+    cmd = [
+        _YTDLP_PATH,
+        "--format", "bestaudio/best",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--embed-thumbnail",
+        "--add-metadata",
+        "--newline",
+        "--no-playlist",
+        "--output", str(out_dir / "%(title)s.%(ext)s"),
+    ]
+    if os.path.isfile(_COOKIES_FILE):
+        cmd += ["--cookies", _COOKIES_FILE]
+        logger.info("Using cookies file: %s", _COOKIES_FILE)
+    else:
+        logger.warning("No cookies.txt found at %s — YouTube may block downloads", _COOKIES_FILE)
+    return cmd
 
 
 async def _spotdl_save(spotify_url: str, save_file: Path) -> list[dict]:
@@ -79,21 +103,8 @@ async def _spotdl_save(spotify_url: str, save_file: Path) -> list[dict]:
 
 
 async def _ytdlp_download(search_or_url: str, out_dir: Path, msg, title: str = "") -> list[Path]:
-    """Download audio via yt-dlp with mobile player clients to bypass bot detection."""
-    cmd = [
-        _YTDLP_PATH,
-        "--extractor-args", "youtube:player_client=android_vr,tv_embedded",
-        "--format", "bestaudio/best",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "--embed-thumbnail",
-        "--add-metadata",
-        "--newline",
-        "--no-playlist",
-        "--output", str(out_dir / "%(title)s.%(ext)s"),
-        search_or_url,
-    ]
+    """Download audio via yt-dlp, using cookies.txt for YouTube authentication."""
+    cmd = _ytdlp_base_cmd(out_dir) + [search_or_url]
     logger.info("yt-dlp: %s", " ".join(cmd))
 
     proc = await asyncio.create_subprocess_exec(
@@ -159,12 +170,10 @@ async def handle_message(update: Update, _) -> None:
         sent_titles: list[str] = []
 
         if is_direct:
-            # YouTube or SoundCloud URL — download directly
             await msg.edit_text("Downloading...")
             files = await _ytdlp_download(url, out_dir, msg)
 
         else:
-            # Spotify URL — resolve metadata first, then download via yt-dlp
             save_file = out_dir / "meta.spotdl"
             try:
                 songs = await _spotdl_save(url, save_file)
@@ -199,12 +208,7 @@ async def handle_message(update: Update, _) -> None:
                 track_dir = out_dir / f"track_{i}"
                 track_dir.mkdir()
 
-                # Search YouTube Music, fall back to YouTube
-                search = f"ytmsearch1:{title}"
-                new_files = await _ytdlp_download(search, track_dir, msg, title)
-                if not new_files:
-                    search = f"ytsearch1:{title}"
-                    new_files = await _ytdlp_download(search, track_dir, msg, title)
+                new_files = await _ytdlp_download(f"ytsearch1:{title}", track_dir, msg, title)
 
                 if new_files:
                     files.extend(new_files)
