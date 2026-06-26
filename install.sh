@@ -24,17 +24,36 @@ info "Installing system dependencies..."
 apt-get update -qq
 apt-get install -y -qq ffmpeg git curl
 
-# --- Conda check ---
-if ! command -v conda &>/dev/null; then
-    warn "Conda is not installed system-wide."
-    warn "Please install Miniconda first: https://docs.conda.io/en/latest/miniconda.html"
-    exit 1
+# --- Find conda ---
+CONDA_BASE=""
+for candidate in /home/*/miniconda3 /home/*/anaconda3 /root/miniconda3 /root/anaconda3 /opt/conda; do
+    if [[ -x "$candidate/bin/conda" ]]; then
+        CONDA_BASE="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$CONDA_BASE" ]]; then
+    if command -v conda &>/dev/null; then
+        CONDA_BASE=$(conda info --base 2>/dev/null || echo "")
+    fi
 fi
 
-CONDA_BASE=$(conda info --base)
+if [[ -z "$CONDA_BASE" || ! -x "$CONDA_BASE/bin/conda" ]]; then
+    warn "Conda not found. Installing Miniconda..."
+    MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+    curl -fsSL "$MINICONDA_URL" -o /tmp/miniconda.sh
+    bash /tmp/miniconda.sh -b -p /opt/miniconda3
+    rm /tmp/miniconda.sh
+    CONDA_BASE="/opt/miniconda3"
+    "$CONDA_BASE/bin/conda" init
+fi
+
+info "Using Conda at: $CONDA_BASE"
+export PATH="$CONDA_BASE/bin:$PATH"
 
 # --- Spotdl conda environment ---
-if conda env list | grep -q "^$CONDA_ENV "; then
+if "$CONDA_BASE/bin/conda" env list | grep -q "^$CONDA_ENV "; then
     info "Conda environment '$CONDA_ENV' already exists."
 else
     info "Creating conda environment '$CONDA_ENV' with Python 3.11..."
@@ -52,12 +71,9 @@ if [[ -d "$INSTALL_DIR" ]]; then
         git pull
     fi
 else
-    info "Cloning project to $INSTALL_DIR..."
-    git clone "$REPO" "$INSTALL_DIR" 2>/dev/null || {
-        warn "Git clone failed. Copying local files instead..."
-        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-        cp -r "$SCRIPT_DIR" "$INSTALL_DIR"
-    }
+    info "Copying project to $INSTALL_DIR..."
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    cp -r "$SCRIPT_DIR" "$INSTALL_DIR"
 fi
 
 cd "$INSTALL_DIR"
