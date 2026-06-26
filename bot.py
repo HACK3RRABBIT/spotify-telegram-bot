@@ -9,7 +9,6 @@ import sys
 import asyncio
 import tempfile
 import logging
-import signal
 from pathlib import Path
 
 from telegram import Update
@@ -24,7 +23,7 @@ except ImportError:
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 SPOTIFY_URL_PATTERN = re.compile(r"https?://open\.spotify\.com/(track|album)/\S+")
 
-# Locate spotdl: prefer same env as this python, then PATH
+# Locate spotdl: same conda env as this python, then PATH
 _SPOTDL_PATH = os.path.join(os.path.dirname(sys.executable), "spotdl")
 if not os.path.isfile(_SPOTDL_PATH):
     _SPOTDL_PATH = "spotdl"
@@ -60,10 +59,12 @@ async def handle_message(update: Update, _) -> None:
 
         cmd = [
             _SPOTDL_PATH,
-            "--output", str(out_dir / "{title}.{ext}"),
+            "--output", str(out_dir / "{title}"),
             "--print-errors",
             url,
         ]
+
+        logger.info(f"Running: {' '.join(cmd)}")
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -72,6 +73,12 @@ async def handle_message(update: Update, _) -> None:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+
+            logger.info(f"spotdl RC={proc.returncode}")
+            if stdout:
+                logger.info(f"spotdl stdout: {stdout.decode()[:1000]}")
+            if stderr:
+                logger.warning(f"spotdl stderr: {stderr.decode()[:1000]}")
 
             if proc.returncode != 0:
                 error_text = (stderr or stdout).decode().strip()[:500]
@@ -82,35 +89,28 @@ async def handle_message(update: Update, _) -> None:
             await msg.edit_text("Download timed out (10 min limit).")
             return
         except Exception as e:
+            logger.exception("Subprocess error")
             await msg.edit_text(f"Error: {e}")
             return
 
-        files = list(out_dir.iterdir())
+        files = sorted(out_dir.iterdir())
         if not files:
+            logger.warning("spotdl exited 0 but no files found in output dir")
             await msg.edit_text("No files were downloaded.")
             return
 
         await msg.edit_text("Uploading...")
 
-        if len(files) == 1:
-            f = files[0]
+        for f in files:
             with open(f, "rb") as fh:
                 await update.message.reply_audio(
                     audio=fh,
                     title=f.stem,
                     filename=f.name,
                 )
-        else:
-            for f in files:
-                with open(f, "rb") as fh:
-                    await update.message.reply_audio(
-                        audio=fh,
-                        title=f.stem,
-                        filename=f.name,
-                    )
-            await update.message.reply_text(f"Sent {len(files)} tracks.")
 
-        await msg.delete()
+        count = len(files)
+        await msg.edit_text(f"Sent {count} track{'s' if count > 1 else ''}.")
 
 
 async def error_handler(update: Update, context) -> None:
@@ -122,13 +122,10 @@ def main():
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN not set. Create a .env file or export it."
         )
-
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-
     logger.info("Bot is running...")
     app.run_polling()
 
