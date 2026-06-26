@@ -1,31 +1,29 @@
-# Spotify Telegram Bot
+# Music Downloader Telegram Bot
 
-A Telegram bot that downloads music from Spotify URLs using [spotdl](https://github.com/spotdl/spotify-downloader).
+A Telegram bot that downloads music from Spotify, YouTube, and SoundCloud — and sends the audio files directly to you.
 
-Send a Spotify track or album link to the bot, and it replies with the audio file.
+Send a link, see the track details, then choose to download (or cancel). For YouTube videos you can pick audio quality before downloading.
 
 ## Features
 
-- Download single tracks or full albums
-- Sends audio files via Telegram
-- Runs as a systemd service on any Linux VPS
-- Uses Conda environment for isolated dependencies
+- **Spotify** — track, album, playlist, artist
+- **YouTube** — single video or full playlist (including YouTube Music)
+- **SoundCloud** — track or set
+- Confirm-before-download: see track info first, then decide
+- YouTube quality selection: Best / Medium / Low
+- Queue system: up to 3 simultaneous downloads; extra requests wait automatically
+- Per-track progress for playlists on all platforms
+- Skips files over Telegram's 49 MB limit with a warning
 
 ## Requirements
 
 - Linux VPS (Ubuntu/Debian recommended)
 - Conda (Miniconda)
-- Telegram bot token (get one from [@BotFather](https://t.me/botfather))
+- Telegram bot token — get one from [@BotFather](https://t.me/botfather)
+- `ffmpeg` system package
+- YouTube cookies file (Netscape format) for bot-detection bypass
 
-## Quick Install
-
-```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/HACK3RRABBIT/spotify-telegram-bot/main/install.sh)"
-```
-
-During install you'll be prompted for your bot token. After that the service starts automatically.
-
-## Manual Setup
+## Setup
 
 ### 1. Clone the repo
 
@@ -34,18 +32,12 @@ git clone https://github.com/HACK3RRABBIT/spotify-telegram-bot.git
 cd spotify-telegram-bot
 ```
 
-### 2. Install dependencies
+### 2. Create the conda environment
 
 ```bash
-# System deps
-sudo apt install ffmpeg
-
-# Create conda env (or use your existing spotify-downloader env)
 conda create -n spotify-downloader python=3.11 -y
 conda activate spotify-downloader
-
-# Install spotdl and bot dependencies
-pip install spotdl python-telegram-bot python-dotenv
+pip install -r requirements.txt
 ```
 
 ### 3. Configure
@@ -55,19 +47,17 @@ cp .env.example .env
 # Edit .env and add your TELEGRAM_BOT_TOKEN
 ```
 
-### 4. Run manually
+### 4. (Optional) YouTube cookie authentication
+
+Export cookies from a browser session logged into YouTube (use a browser extension like *Get cookies.txt LOCALLY*) and save the Netscape-format file as `cookies.txt` in the bot directory. Without this the server IP may be blocked by YouTube's bot detection.
+
+### 5. Run
 
 ```bash
 conda run -n spotify-downloader python bot.py
 ```
 
-### 5. Run as a service (systemd)
-
-```bash
-sudo ./install.sh
-```
-
-Or manually:
+Or as a systemd service:
 
 ```bash
 sudo cp spotify-telegram-bot.service /etc/systemd/system/
@@ -75,49 +65,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now spotify-telegram-bot
 ```
 
-## Usage
-
-1. Start a chat with your bot on Telegram
-2. Send `/start`
-3. Send a Spotify URL:
-   - Track: `https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT`
-   - Album: `https://open.spotify.com/album/1kfVWZRg3nL3PmZ3Gd8k2H`
-4. Wait for the bot to download and send the audio
-
-## Commands
-
-| Command  | Description          |
-|----------|----------------------|
-| `/start` | Show help message    |
-
-## Service Management
+## Service commands
 
 ```bash
-# Status
 systemctl status spotify-telegram-bot
-
-# Logs
 journalctl -u spotify-telegram-bot -f
-
-# Restart
 sudo systemctl restart spotify-telegram-bot
-
-# Stop
-sudo systemctl stop spotify-telegram-bot
 ```
 
-## Project Structure
+## Project structure
 
 ```
-├── bot.py                      # Main bot logic
-├── requirements.txt            # Python dependencies
-├── install.sh                  # Automated VPS installer
-├── spotify-telegram-bot.service  # systemd unit file
-├── .env.example                # Token configuration template
-├── .gitignore
-└── README.md
+├── bot.py                         # Main bot
+├── requirements.txt               # Python dependencies
+├── cookies.txt                    # YouTube cookies (not committed)
+├── .env                           # Bot token (not committed)
+├── .env.example
+├── spotify-telegram-bot.service   # systemd unit
+├── install.sh
+└── .github/workflows/deploy.yml  # Auto-deploy on push to main
 ```
-
-## License
-
-MIT
