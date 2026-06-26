@@ -83,18 +83,30 @@ async def _run_spotdl(cmd, msg, timeout=600):
     downloaded_titles = []
     failed_yt_urls = []
     last_edit = asyncio.get_event_loop().time()
-    state = {"text": "Looking up track..."}
+    state = {"text": "Looking up track...", "prev": ""}
 
     def on_line(line):
         all_lines.append(line)
         logger.info("spotdl: %s", line)
 
+        # Error and URL may be on consecutive lines:
+        #   "AudioProviderError: YT-DLP download error -"
+        #   "https://music.youtube.com/watch?v=..."
+        if line.startswith("https://") and "AudioProviderError" in state["prev"]:
+            failed_yt_urls.append(line.strip())
+            state["text"] = "⚠️ YouTube blocked — retrying with fallback..."
+            state["prev"] = line
+            return
+
+        # Also handle case where URL is on the same line
         m = _RE_PROVIDER_ERR.search(line)
         if m:
             failed_yt_urls.append(m.group(1))
             state["text"] = "⚠️ YouTube blocked — retrying with fallback..."
+            state["prev"] = line
             return
 
+        state["prev"] = line
         m = _RE_STAGE.match(line)
         if m:
             track, stage = m.group(1).strip(), m.group(2)
@@ -113,6 +125,7 @@ async def _run_spotdl(cmd, msg, timeout=600):
         if m:
             done, total = int(m.group(1)), int(m.group(2))
             state["text"] = f"Downloaded {done}/{total} tracks\n{_bar(done * 10 // total)}"
+            return
 
     reader = asyncio.create_task(_stream(proc, on_line))
     deadline = asyncio.get_event_loop().time() + timeout
