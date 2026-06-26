@@ -140,12 +140,69 @@ def _clean_pending() -> None:
 # ── Quick metadata fetch (no download) ───────────────────────────────────────
 
 async def _fetch_yt_sc_info(url: str) -> dict | None:
-    """Fetch title / count from YouTube or SoundCloud without downloading.
+    """Fetch title / track list from YouTube or SoundCloud without downloading."""
+    is_sc = "soundcloud.com" in url.lower()
 
-    stderr is sent to DEVNULL so yt-dlp's cookie-loading messages don't
-    corrupt the JSON that comes on stdout.
-    For YouTube, falls back to the public oEmbed API if yt-dlp is blocked.
-    """
+    if is_sc:
+        return await _fetch_sc_info(url)
+    else:
+        return await _fetch_yt_info(url)
+
+
+async def _fetch_sc_info(url: str) -> dict | None:
+    """SoundCloud: use yt-dlp --print to get real track titles (flat-playlist lacks them)."""
+    SEP = "|||"
+    cmd = [_YTDLP] + _cookie_args() + [
+        "--no-warnings",
+        "--print", f"%(title)s{SEP}%(uploader)s{SEP}%(duration)s",
+        url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=40)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return None
+
+    lines = [l for l in out_bytes.decode(errors="replace").splitlines() if l.strip()]
+    if not lines:
+        return None
+
+    if len(lines) == 1:
+        parts = lines[0].split(SEP)
+        return {
+            "kind": "single", "count": 1,
+            "title":    parts[0] if parts[0] != "NA" else "Track",
+            "channel":  parts[1] if len(parts) > 1 and parts[1] != "NA" else "",
+            "duration": _dur(parts[2]) if len(parts) > 2 and parts[2] != "NA" else "?",
+        }
+
+    # Playlist — first line is the playlist itself, rest are tracks
+    # (yt-dlp prints one line per track when given a playlist URL)
+    tracks = []
+    playlist_title = ""
+    playlist_channel = ""
+    for line in lines:
+        parts = line.split(SEP)
+        title   = parts[0] if parts[0] != "NA" else ""
+        channel = parts[1] if len(parts) > 1 and parts[1] != "NA" else ""
+        dur     = _dur(parts[2]) if len(parts) > 2 and parts[2] != "NA" else "?"
+        if not playlist_title:
+            playlist_title   = title
+            playlist_channel = channel
+        tracks.append({"title": title, "uploader": channel, "duration": dur})
+
+    return {
+        "kind": "playlist", "count": len(tracks),
+        "title":   playlist_title or "SoundCloud Playlist",
+        "channel": playlist_channel,
+        "tracks":  tracks,
+    }
+
+
+async def _fetch_yt_info(url: str) -> dict | None:
+    """YouTube: use yt-dlp --flat-playlist -J for fast metadata."""
     proc = await asyncio.create_subprocess_exec(
         *([_YTDLP] + _cookie_args() + ["--flat-playlist", "-J", "--no-warnings", url]),
         stdout=asyncio.subprocess.PIPE,
@@ -155,38 +212,29 @@ async def _fetch_yt_sc_info(url: str) -> dict | None:
         out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
     except asyncio.TimeoutError:
         proc.kill()
-        out_bytes = b""
+        return await _fetch_oembed_fallback(url)
 
-    out = out_bytes.decode(errors="replace").strip()
     try:
-        d = json.loads(out)
+        d = json.loads(out_bytes.decode(errors="replace").strip())
     except Exception:
-        d = None
-
-    if d is None:
-        logger.warning("yt-dlp -J failed for %s — trying oEmbed fallback", url)
         return await _fetch_oembed_fallback(url)
 
     if d.get("_type") == "playlist":
         entries = d.get("entries") or []
-        tracks = []
-        for e in entries:
-            title = e.get("title", "")
-            # SoundCloud flat-playlist entries often have no title — derive from URL slug
-            if not title:
-                url_slug = (e.get("url") or e.get("webpage_url") or "").rstrip("/").split("/")[-1]
-                title = url_slug.replace("-", " ").title() if url_slug else ""
-            tracks.append({
-                "title":    title,
+        tracks = [
+            {
+                "title":    e.get("title", ""),
                 "uploader": e.get("uploader") or e.get("channel", ""),
                 "duration": _dur(e.get("duration")),
-            })
+            }
+            for e in entries
+        ]
         return {
             "kind":    "playlist",
             "count":   len(entries),
             "title":   d.get("title", "Playlist"),
-            "tracks":  tracks,
             "channel": d.get("uploader") or d.get("channel", ""),
+            "tracks":  tracks,
         }
     return {
         "kind":     "single",
