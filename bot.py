@@ -24,6 +24,11 @@ except ImportError:
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 SPOTIFY_URL_PATTERN = re.compile(r"https?://open\.spotify\.com/(track|album)/\S+")
 
+# Locate spotdl: prefer same env as this python, then PATH
+_SPOTDL_PATH = os.path.join(os.path.dirname(sys.executable), "spotdl")
+if not os.path.isfile(_SPOTDL_PATH):
+    _SPOTDL_PATH = "spotdl"
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -54,7 +59,7 @@ async def handle_message(update: Update, _) -> None:
         out_dir = Path(tmpdir)
 
         cmd = [
-            "spotdl",
+            _SPOTDL_PATH,
             "--output", str(out_dir / "{title}.{ext}"),
             "--print-errors",
             url,
