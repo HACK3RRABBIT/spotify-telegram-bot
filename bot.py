@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram bot that downloads Spotify tracks/albums using spotdl.
+Telegram bot that downloads Spotify / YouTube / SoundCloud tracks using spotdl.
 """
 
 import os
@@ -22,7 +22,14 @@ except ImportError:
     pass
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-SPOTIFY_URL_PATTERN = re.compile(r"https?://open\.spotify\.com/(track|album)/\S+")
+
+# Supported URL patterns
+URL_PATTERN = re.compile(
+    r"https?://(open\.spotify\.com/(track|album|playlist|artist)/"
+    r"|music\.youtube\.com/|youtube\.com/watch|youtu\.be/"
+    r"|soundcloud\.com/)\S+",
+    re.IGNORECASE,
+)
 
 # Locate spotdl: same conda env as this python, then PATH
 _SPOTDL_PATH = os.path.join(os.path.dirname(sys.executable), "spotdl")
@@ -36,85 +43,135 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# How often (seconds) to push progress edits to Telegram
-_PROGRESS_INTERVAL = 4
+# Seconds between Telegram message edits (Telegram rate-limits to ~1/s per message)
+_EDIT_INTERVAL = 3
 
 
-async def start(update: Update, _) -> None:
-    await update.message.reply_text(
-        "Send me a Spotify track or album URL and I'll download it for you."
-        "\n\nExamples:"
-        "\n  https://open.spotify.com/track/..."
-        "\n  https://open.spotify.com/album/..."
-    )
+def _parse_spotdl_line(line: str) -> dict:
+    """Extract info from a spotdl --simple-tui output line."""
+    info = {}
+    # "Downloaded  track-name"  or  "Skipping  track-name"
+    for keyword in ("Downloaded", "Skipping", "Downloading", "Converting", "Embed"):
+        if keyword in line:
+            info["event"] = keyword
+            break
+    # "Failed to download track-name"
+    if "Failed" in line or "failed" in line:
+        info["event"] = "Failed"
+    # Percent: spotdl simple-tui prints lines like "10%|..." or "[10%]"
+    m = re.search(r"(\d{1,3})%", line)
+    if m:
+        info["percent"] = int(m.group(1))
+    return info
 
 
-async def _run_spotdl(cmd: list[str], msg, timeout: int = 600) -> tuple[int, str]:
-    """Run spotdl and stream progress to Telegram. Returns (returncode, full_output)."""
+async def _run_spotdl(
+    cmd: list[str], msg, timeout: int = 600
+) -> tuple[int, str, list[str]]:
+    """
+    Run spotdl, stream output, update Telegram progress.
+    Returns (returncode, full_output, downloaded_titles).
+    """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,  # merge so we catch all output
+        stderr=asyncio.subprocess.STDOUT,
     )
 
-    lines: list[str] = []
+    all_lines: list[str] = []
+    downloaded_titles: list[str] = []
     last_edit = asyncio.get_event_loop().time()
     downloaded = 0
     failed = 0
+    current_percent: int | None = None
+    current_track = ""
 
     async def read_lines():
-        nonlocal downloaded, failed
+        nonlocal downloaded, failed, current_percent, current_track
         async for raw in proc.stdout:
             line = raw.decode(errors="replace").rstrip()
             if not line:
                 continue
-            lines.append(line)
+            all_lines.append(line)
             logger.info(f"spotdl: {line}")
-            if "Downloaded" in line:
+
+            info = _parse_spotdl_line(line)
+            evt = info.get("event", "")
+
+            if evt == "Downloading":
+                # Extract track name after "Downloading  <name>"
+                parts = line.split(None, 1)
+                if len(parts) > 1:
+                    current_track = parts[1].strip()
+                current_percent = 0
+
+            elif evt in ("Converting", "Embed"):
+                current_percent = 99  # almost done
+
+            elif evt == "Downloaded":
                 downloaded += 1
-            if "Failed" in line or "Error" in line.capitalize():
+                parts = line.split(None, 1)
+                title = parts[1].strip() if len(parts) > 1 else current_track
+                downloaded_titles.append(title)
+                current_percent = None
+                current_track = ""
+
+            elif evt == "Failed":
                 failed += 1
 
-    reader = asyncio.create_task(read_lines())
+            if "percent" in info:
+                current_percent = info["percent"]
 
-    # Periodically update the Telegram message with current progress
+    reader = asyncio.create_task(read_lines())
     deadline = asyncio.get_event_loop().time() + timeout
+
     while not reader.done():
         now = asyncio.get_event_loop().time()
         if now >= deadline:
             proc.kill()
             await reader
-            return -1, "\n".join(lines)
+            return -1, "\n".join(all_lines), downloaded_titles
 
-        if now - last_edit >= _PROGRESS_INTERVAL:
-            status = f"Downloading... {downloaded} done"
+        if now - last_edit >= _EDIT_INTERVAL:
+            # Build status line
+            if current_track:
+                pct = f" {current_percent}%" if current_percent is not None else ""
+                status = f"Downloading{pct}: `{current_track[:60]}`"
+            else:
+                status = f"Downloading... ({downloaded} done)"
             if failed:
                 status += f", {failed} failed"
-            if lines:
-                # Show last meaningful line as hint
-                last = next(
-                    (l for l in reversed(lines) if l.strip() and not l.startswith("[")),
-                    lines[-1],
-                )
-                status += f"\n`{last[:120]}`"
             try:
                 await msg.edit_text(status, parse_mode="Markdown")
             except Exception:
-                pass  # Telegram may throttle edits; that's fine
+                pass
             last_edit = now
 
         await asyncio.sleep(1)
 
     await reader
     rc = await proc.wait()
-    return rc, "\n".join(lines)
+    return rc, "\n".join(all_lines), downloaded_titles
+
+
+async def start(update: Update, _) -> None:
+    await update.message.reply_text(
+        "Send me a link and I'll download it for you.\n\n"
+        "Supported sources:\n"
+        "  Spotify — track, album, playlist, artist\n"
+        "  YouTube — youtube.com/watch or youtu.be\n"
+        "  SoundCloud — soundcloud.com/...\n\n"
+        "Note: download speed depends on your server's internet connection."
+    )
 
 
 async def handle_message(update: Update, _) -> None:
     url = update.message.text.strip()
 
-    if not SPOTIFY_URL_PATTERN.match(url):
-        await update.message.reply_text("Please send a valid Spotify URL.")
+    if not URL_PATTERN.search(url):
+        await update.message.reply_text(
+            "Please send a Spotify, YouTube, or SoundCloud URL."
+        )
         return
 
     msg = await update.message.reply_text("Starting download...")
@@ -125,14 +182,14 @@ async def handle_message(update: Update, _) -> None:
         cmd = [
             _SPOTDL_PATH,
             "--output", str(out_dir) + "/{title}",
+            "--simple-tui",
             "--print-errors",
             url,
         ]
-
         logger.info(f"Running: {' '.join(cmd)}")
 
         try:
-            rc, output = await _run_spotdl(cmd, msg)
+            rc, output, downloaded_titles = await _run_spotdl(cmd, msg)
         except Exception as e:
             logger.exception("Subprocess error")
             await msg.edit_text(f"Error starting download: {e}")
@@ -142,21 +199,20 @@ async def handle_message(update: Update, _) -> None:
             await msg.edit_text("Download timed out (10 min limit).")
             return
 
-        files = sorted(
-            f for f in out_dir.iterdir() if f.is_file()
-        )
+        files = sorted(f for f in out_dir.iterdir() if f.is_file())
 
         if not files:
             tail = "\n".join(output.splitlines()[-10:]) if output else "(no output)"
             logger.warning(f"spotdl exited {rc} but no files found.\n{output}")
             await msg.edit_text(
-                f"No files were downloaded (exit code {rc}).\n\nLast output:\n`{tail[:400]}`",
+                f"No files were downloaded (exit {rc}).\n\nLast output:\n`{tail[:400]}`",
                 parse_mode="Markdown",
             )
             return
 
         await msg.edit_text(f"Uploading {len(files)} track(s)...")
 
+        sent_names: list[str] = []
         for f in files:
             try:
                 with open(f, "rb") as fh:
@@ -165,18 +221,25 @@ async def handle_message(update: Update, _) -> None:
                         title=f.stem,
                         filename=f.name,
                     )
+                sent_names.append(f.stem)
             finally:
-                # Delete each file immediately after upload to free disk space
+                # Free disk space immediately after each upload
                 try:
                     f.unlink()
                 except OSError:
                     pass
 
-        count = len(files)
-        await msg.edit_text(f"Sent {count} track{'s' if count > 1 else ''}.")
+        # Final summary with track names
+        if sent_names:
+            names_text = "\n".join(f"• {n}" for n in sent_names)
+            await msg.edit_text(
+                f"Sent {len(sent_names)} track(s):\n{names_text}"
+            )
+        else:
+            await msg.edit_text("Done.")
 
     finally:
-        # Always clean up the temp directory, even if we crash mid-download
+        # Always remove the temp dir, even on crash
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
