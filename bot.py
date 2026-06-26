@@ -171,9 +171,11 @@ async def handle_message(update: Update, _) -> None:
         cmd = [
             _SPOTDL_PATH,
             "--output", str(out_dir) + "/{title}",
-            "--overwrite", "force",   # never skip due to cache
-            "--simple-tui",           # parseable line-by-line output
-            "--yt-dlp-args=--newline",# yt-dlp progress on separate lines
+            "--overwrite", "force",       # never skip due to cache
+            "--simple-tui",               # parseable line-by-line output
+            "--yt-dlp-args=--newline",    # yt-dlp progress on separate lines
+            "--audio", "youtube-music", "youtube", "soundcloud",  # fallback sources
+            "--dont-filter-results",      # don't reject non-latin / low-score matches
             url,
         ]
         logger.info("Running: %s", " ".join(cmd))
