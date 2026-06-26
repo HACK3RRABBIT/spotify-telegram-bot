@@ -960,17 +960,12 @@ async def _run_download(bot, chat_id: int, msg, ctx: dict) -> None:
                     await msg.edit_text(
                         "🔒 This content is DRM-protected and cannot be downloaded.")
                 elif err == "auth":
-                    has_cookies = os.path.isfile(_COOKIES)
-                    if has_cookies:
-                        await msg.edit_text(
-                            "🔑 This video requires a YouTube login.\n\n"
-                            "Your cookies.txt may have expired. Please export fresh cookies "
-                            "from your browser (logged into YouTube) and send the file here.")
-                    else:
-                        await msg.edit_text(
-                            "🔒 This video requires a YouTube account to download "
-                            "(age-restricted or private).\n\n"
-                            "Send your YouTube cookies.txt file here to unlock it.")
+                    await msg.edit_text(
+                        "🚫 YouTube blocked this download.\n\n"
+                        "This video is age-restricted and YouTube blocks server IPs "
+                        "from downloading it — even with valid cookies. "
+                        "This is a YouTube network-level restriction on datacenter IPs, "
+                        "not a cookies problem.")
                 elif err == "geo":
                     await msg.edit_text(
                         "🌍 This content is not available in this server's region.")
