@@ -143,6 +143,9 @@ async def _fetch_yt_sc_info(url: str) -> dict | None:
     except Exception:
         logger.warning("yt-dlp -J parse failed for %s: %r", url, out[:200])
         return None
+    if d is None:
+        logger.warning("yt-dlp -J returned null for %s (blocked or unavailable)", url)
+        return None
     if d.get("_type") == "playlist":
         entries = d.get("entries") or []
         return {"kind": "playlist", "count": len(entries),
