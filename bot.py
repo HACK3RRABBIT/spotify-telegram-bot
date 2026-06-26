@@ -49,7 +49,9 @@ CONFIRM_TTL    = 300        # seconds a confirm button stays active
 #   YTDLP_PROXY=http://user:pass@proxy.webshare.io:80
 #   YTDLP_PROXY=socks5://user:pass@gate.smartproxy.com:7000
 # Leave unset to connect directly (YouTube may block the server IP).
-YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
+YTDLP_PROXY  = os.environ.get("YTDLP_PROXY", "").strip()
+# spotdl only accepts HTTP/HTTPS proxies; privoxy bridges HTTP→WARP SOCKS5
+SPOTDL_PROXY = os.environ.get("SPOTDL_PROXY", "").strip()
 
 
 # ── Binary / path resolution ──────────────────────────────────────────────────
@@ -115,7 +117,7 @@ def _cookie_args() -> list[str]:
 
 
 def _spotdl_proxy_args() -> list[str]:
-    return ["--proxy", YTDLP_PROXY] if YTDLP_PROXY else []
+    return ["--proxy", SPOTDL_PROXY] if SPOTDL_PROXY else []
 
 
 async def _run(cmd: list[str], timeout: int = 60) -> tuple[str, int]:
