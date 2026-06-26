@@ -155,30 +155,61 @@ info "Installing Python packages..."
     httpx \
     bgutil-ytdlp-pot-provider
 
-# ── 5. bgutil PO-token provider (Deno) ───────────────────────────────────────
+# ── 5. bgutil PO-token provider (Node.js server) ─────────────────────────────
 # bgutil generates YouTube Proof-of-Origin tokens that satisfy bot-detection
-# challenges. Combined with WARP, this lets the server pass YouTube's checks.
+# challenges. Runs as a persistent HTTP server on port 4416.
+# Combined with WARP, this lets the server pass YouTube's checks reliably.
 step "Installing bgutil yt-dlp PO-token provider..."
 BGUTIL_DIR="/root/bgutil-ytdlp-pot-provider"
 
-if ! command -v deno &>/dev/null; then
-    info "Installing Deno runtime..."
-    curl -fsSL https://deno.land/install.sh | sh
-    export DENO_INSTALL="/root/.deno"
-    export PATH="$DENO_INSTALL/bin:$PATH"
-    echo 'export DENO_INSTALL="/root/.deno"' >> /root/.bashrc
-    echo 'export PATH="$DENO_INSTALL/bin:$PATH"' >> /root/.bashrc
+# Install Node.js if not present
+if ! command -v node &>/dev/null; then
+    info "Installing Node.js..."
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs
 fi
 
 if [[ ! -d "$BGUTIL_DIR" ]]; then
-    git clone https://github.com/LuanRT/bgutil-ytdlp-pot-provider "$BGUTIL_DIR"
+    git clone https://github.com/Brainicism/bgutil-ytdlp-pot-provider "$BGUTIL_DIR"
 else
     git -C "$BGUTIL_DIR" pull
 fi
 
 cd "$BGUTIL_DIR/server"
 npm install --prefer-offline 2>/dev/null || npm install
+npm run build 2>/dev/null || true
 cd -
+
+# Systemd service for bgutil server (port 4416)
+NODE_BIN=$(command -v node)
+cat > /etc/systemd/system/bgutil-pot-server.service <<UNIT
+[Unit]
+Description=bgutil YouTube PO-Token Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$BGUTIL_DIR/server
+ExecStart=$NODE_BIN $BGUTIL_DIR/server/build/index.js
+Restart=always
+RestartSec=5
+Environment=PORT=4416
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable bgutil-pot-server
+systemctl restart bgutil-pot-server
+sleep 2
+
+if systemctl is-active --quiet bgutil-pot-server; then
+    info "bgutil PO-token server running on port 4416"
+else
+    warn "bgutil server failed to start — YouTube downloads may be limited"
+fi
 
 # ── 6. Clone / update bot ─────────────────────────────────────────────────────
 step "Installing bot..."

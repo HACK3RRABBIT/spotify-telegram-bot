@@ -1,6 +1,6 @@
 [Unit]
 Description=Spotify Telegram Bot
-After=network.target
+After=network.target bgutil-pot-server.service
 
 [Service]
 Type=simple

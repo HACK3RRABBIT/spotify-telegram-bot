@@ -107,17 +107,43 @@ def _dur(s) -> str:
         return "?"
 
 
+_BGUTIL_URL = os.environ.get("BGUTIL_URL", "http://127.0.0.1:4416").strip()
+
+def _bgutil_args() -> list[str]:
+    """Add bgutil PO-token server args if the server is reachable."""
+    try:
+        import urllib.request
+        urllib.request.urlopen(f"{_BGUTIL_URL}/health", timeout=1)
+        return ["--extractor-args", f"youtube:getpot_bgutil_baseurl={_BGUTIL_URL}"]
+    except Exception:
+        return []
+
+
 def _cookie_args() -> list[str]:
     args = []
     if os.path.isfile(_COOKIES):
         args += ["--cookies", _COOKIES]
     if YTDLP_PROXY:
         args += ["--proxy", YTDLP_PROXY]
+    args += _bgutil_args()
     return args
 
 
 def _spotdl_proxy_args() -> list[str]:
     return ["--proxy", SPOTDL_PROXY] if SPOTDL_PROXY else []
+
+
+# yt-dlp attempt strategies (tried in order until one succeeds):
+#   1. android_vr client  — uses YouTube's TV/mobile API, less bot-checked
+#   2. ios client         — another mobile endpoint
+#   3. mweb client        — mobile web, different fingerprint
+# Each attempt also uses WARP proxy + bgutil PO tokens + cookies if available.
+_YT_CLIENT_STRATEGIES = [
+    ["--extractor-args", "youtube:player_client=android_vr"],
+    ["--extractor-args", "youtube:player_client=ios"],
+    ["--extractor-args", "youtube:player_client=mweb"],
+    [],  # last resort: yt-dlp default (web client)
+]
 
 
 async def _run(cmd: list[str], timeout: int = 60) -> tuple[str, int]:
@@ -532,10 +558,6 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
         else "%(title)s.%(ext)s"))
     no_pl = [] if is_playlist else ["--no-playlist"]
 
-    # Format strategy (ordered by preference):
-    #   m4a  — YouTube serves AAC in m4a; no re-encoding needed, fastest
-    #   webm — YouTube's opus stream; also no re-encoding needed
-    #   mp3  — fallback: requires ffmpeg re-encode, slow on 1-core VPS
     if AUDIO_FORMAT == "mp3":
         aq = {"best": "0", "mid": "5", "low": "9"}.get(quality, "0")
         fmt_args = [
@@ -544,7 +566,6 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
         ]
         ext_glob = "*.mp3"
     else:
-        # For quality choices just pick different bitrate tiers via format selector
         q_fmt = {
             "best": f"bestaudio[ext={AUDIO_FORMAT}]/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
             "mid":  "bestaudio[abr<=128]/bestaudio",
@@ -553,57 +574,80 @@ async def _ytdlp_download(url: str, out_dir: Path, msg,
         fmt_args = ["--format", q_fmt]
         ext_glob = f"*.{AUDIO_FORMAT}"
 
-    cmd = [_YTDLP] + _cookie_args() + no_pl + fmt_args + [
-        "--add-metadata",
-        "--newline",
-        "--output", out_tmpl,
-        url,
+    base_cmd = [_YTDLP] + _cookie_args() + no_pl + fmt_args + [
+        "--add-metadata", "--newline", "--output", out_tmpl,
     ]
-    logger.info("yt-dlp cmd: %s", " ".join(cmd))
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-
-    cur = tot = 0
+    # Try each client strategy in order until one produces a file
     error_type: str | None = None
-    last_edit = asyncio.get_event_loop().time()
+    for attempt, client_args in enumerate(_YT_CLIENT_STRATEGIES):
+        cmd = base_cmd + client_args + [url]
+        logger.info("yt-dlp attempt %d: %s", attempt + 1, " ".join(cmd))
 
-    async for raw in proc.stdout:
-        line = raw.decode(errors="replace").rstrip()
-        if not line:
-            continue
-        logger.info("yt-dlp: %s", line)
+        if attempt > 0:
+            try:
+                await msg.edit_text(f"⚠️ Retrying with method {attempt + 1}/4...")
+            except Exception:
+                pass
+            # Clean up any partial files from previous attempt
+            for f in out_dir.rglob("*.part"):
+                try: f.unlink()
+                except OSError: pass
 
-        if _RE_AUTH_ERR.search(line):
-            error_type = "auth"
-        elif _RE_DRM_ERR.search(line):
-            error_type = "drm"
-        elif _RE_GEO_ERR.search(line):
-            error_type = "geo"
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 
-        mi = _RE_ITEM.search(line)
-        if mi:
-            cur, tot = int(mi.group(1)), int(mi.group(2))
+        cur = tot = 0
+        attempt_error: str | None = None
+        last_edit = asyncio.get_event_loop().time()
 
-        mp = _RE_PCT.search(line)
-        if mp:
-            pct = min(int(float(mp.group(1))), 100)
-            now = asyncio.get_event_loop().time()
-            if now - last_edit >= 3:
-                text = (f"📥 Track {cur}/{tot}\n{_bar(pct)} {pct}%"
-                        if tot > 1 else f"📥 Downloading...\n{_bar(pct)} {pct}%")
-                try:
-                    await msg.edit_text(text)
-                except Exception:
-                    pass
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            logger.info("yt-dlp: %s", line)
+
+            if _RE_AUTH_ERR.search(line):
+                attempt_error = "auth"
+            elif _RE_DRM_ERR.search(line):
+                attempt_error = "drm"
+            elif _RE_GEO_ERR.search(line):
+                attempt_error = "geo"
+
+            mi = _RE_ITEM.search(line)
+            if mi:
+                cur, tot = int(mi.group(1)), int(mi.group(2))
+
+            mp = _RE_PCT.search(line)
+            if mp:
+                pct = min(int(float(mp.group(1))), 100)
+                now = asyncio.get_event_loop().time()
+                if now - last_edit >= 3:
+                    text = (f"📥 Track {cur}/{tot}\n{_bar(pct)} {pct}%"
+                            if tot > 1 else f"📥 Downloading...\n{_bar(pct)} {pct}%")
+                    try:
+                        await msg.edit_text(text)
+                    except Exception:
+                        pass
                 last_edit = now
 
     await proc.wait()
-    files = sorted(p for p in out_dir.rglob(ext_glob) if p.is_file())
-    if not files:  # pick up any audio file if format didn't match exactly
-        files = sorted(p for p in out_dir.rglob("*") if p.is_file() and p.suffix in
-                       {".mp3", ".m4a", ".webm", ".opus", ".ogg", ".flac", ".wav"})
-    return files, (None if files else error_type)
+        await proc.wait()
+
+        # Check if we got files — if yes, stop retrying
+        files = sorted(p for p in out_dir.rglob(ext_glob) if p.is_file())
+        if not files:
+            files = sorted(p for p in out_dir.rglob("*") if p.is_file() and p.suffix in
+                           {".mp3", ".m4a", ".webm", ".opus", ".ogg", ".flac", ".wav"})
+        if files:
+            return files, None
+
+        error_type = attempt_error
+        # DRM / geo errors won't be fixed by retrying with a different client
+        if attempt_error in ("drm", "geo"):
+            break
+
+    return [], error_type
 
 
 # ── Upload helper ─────────────────────────────────────────────────────────────
