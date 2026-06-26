@@ -20,6 +20,8 @@ import time
 import uuid
 from pathlib import Path
 
+import httpx
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -120,13 +122,26 @@ def _clean_pending() -> None:
 # ── Quick metadata fetch (no download) ───────────────────────────────────────
 
 async def _fetch_yt_sc_info(url: str) -> dict | None:
-    """Fetch title / count from YouTube or SoundCloud without downloading."""
-    out, _ = await _run(
-        [_YTDLP] + _cookie_args() + ["--flat-playlist", "-J", "--no-warnings", url],
-        timeout=20)
+    """Fetch title / count from YouTube or SoundCloud without downloading.
+
+    stderr is sent to DEVNULL so yt-dlp's cookie-loading messages don't
+    corrupt the JSON that comes on stdout.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *([_YTDLP] + _cookie_args() + ["--flat-playlist", "-J", "--no-warnings", url]),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return None
+    out = out_bytes.decode(errors="replace").strip()
     try:
         d = json.loads(out)
     except Exception:
+        logger.warning("yt-dlp -J parse failed for %s: %r", url, out[:200])
         return None
     if d.get("_type") == "playlist":
         entries = d.get("entries") or []
@@ -138,6 +153,29 @@ async def _fetch_yt_sc_info(url: str) -> dict | None:
         "duration": _dur(d.get("duration")),
         "channel": d.get("uploader") or d.get("channel", ""),
     }
+
+
+_RE_SONGS = re.compile(r"(\d+)\s+Song", re.I)
+
+
+async def _fetch_spotify_info(url: str) -> dict | None:
+    """Quick Spotify metadata via the public oembed endpoint (no auth needed)."""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://open.spotify.com/oembed", params={"url": url})
+            if r.status_code != 200:
+                return None
+            d = r.json()
+    except Exception as e:
+        logger.warning("Spotify oembed failed: %s", e)
+        return None
+
+    title = d.get("title", "")
+    desc  = d.get("description", "")  # e.g. "50 Songs. 3 hours, 44 minutes."
+    m     = _RE_SONGS.search(desc)
+    count = int(m.group(1)) if m else None
+    return {"title": title, "count": count, "description": desc}
 
 
 # ── Confirm UI ────────────────────────────────────────────────────────────────
@@ -156,7 +194,15 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
         kind = m.group(1) if m else "track"
         icons  = {"track": "🎵", "album": "💿", "playlist": "📋", "artist": "🎤"}
         labels = {"track": "Track", "album": "Album", "playlist": "Playlist", "artist": "Artist"}
-        text = f"{icons.get(kind, '🎵')} Spotify {labels.get(kind, 'Track')}\n\nDownload?"
+        icon  = icons.get(kind, "🎵")
+        label = labels.get(kind, "Track")
+        if info and info.get("title"):
+            title_line = f"{icon} {info['title']}"
+            if info.get("count"):
+                title_line += f"\n🎶 {info['count']} tracks"
+        else:
+            title_line = f"{icon} Spotify {label}"
+        text = f"{title_line}\n\nDownload?"
         kb   = InlineKeyboardMarkup([[
             InlineKeyboardButton("▶️ Download", callback_data=f"dl:{token}:best"),
             InlineKeyboardButton("❌ Cancel",   callback_data=f"no:{token}"),
@@ -489,12 +535,13 @@ async def handle_message(update: Update, context) -> None:
 
     platform = "spotify" if is_sp else ("youtube" if is_yt else "soundcloud")
     info = None
-    if not is_sp:
+    if is_sp:
+        info = await _fetch_spotify_info(text)  # best-effort, None is fine
+    else:
         info = await _fetch_yt_sc_info(text)
         if info is None:
-            await msg.edit_text(
-                "❌ Could not fetch info for this URL. Check the link and try again.")
-            return
+            logger.warning("Info fetch returned None for %s — showing generic confirm", text)
+            # Fall through with info=None; _build_confirm handles it gracefully
 
     confirm_text, kb, _ = _build_confirm(text, platform, info)
     await msg.edit_text(confirm_text, reply_markup=kb)
