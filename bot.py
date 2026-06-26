@@ -169,13 +169,27 @@ async def _fetch_yt_sc_info(url: str) -> dict | None:
 
     if d.get("_type") == "playlist":
         entries = d.get("entries") or []
-        return {"kind": "playlist", "count": len(entries),
-                "title": d.get("title", "Playlist")}
+        tracks = [
+            {
+                "title":    e.get("title", ""),
+                "uploader": e.get("uploader") or e.get("channel", ""),
+                "duration": _dur(e.get("duration")),
+            }
+            for e in entries
+        ]
+        return {
+            "kind":    "playlist",
+            "count":   len(entries),
+            "title":   d.get("title", "Playlist"),
+            "tracks":  tracks,
+            "channel": d.get("uploader") or d.get("channel", ""),
+        }
     return {
-        "kind": "single", "count": 1,
-        "title": d.get("title", "Track"),
+        "kind":     "single",
+        "count":    1,
+        "title":    d.get("title", "Track"),
         "duration": _dur(d.get("duration")),
-        "channel": d.get("uploader") or d.get("channel", ""),
+        "channel":  d.get("uploader") or d.get("channel", ""),
     }
 
 
@@ -253,6 +267,26 @@ async def _fetch_spotify_info(url: str, msg=None) -> dict | None:
 
 # ── Confirm UI ────────────────────────────────────────────────────────────────
 
+def _format_track_list(tracks: list, total: int, limit: int = 15) -> str:
+    """Return a numbered track list string for playlists. Empty string if no tracks."""
+    if not tracks:
+        return ""
+    lines = []
+    for i, t in enumerate(tracks[:limit], 1):
+        # Spotify songs have 'name'/'artist'; yt-dlp entries have 'title'/'uploader'
+        name     = t.get("name") or t.get("title", "")
+        artist   = t.get("artist") or t.get("uploader", "")
+        dur      = f"  ⏱{t['duration']}" if t.get("duration") and t["duration"] != "?" else ""
+        if artist:
+            lines.append(f"{i}. {artist} — {name}{dur}")
+        else:
+            lines.append(f"{i}. {name}{dur}")
+    result = "\n" + "\n".join(lines)
+    if total > limit:
+        result += f"\n_... and {total - limit} more_"
+    return result
+
+
 def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, InlineKeyboardMarkup, str]:
     """
     Returns (message_text, keyboard, token).
@@ -276,17 +310,7 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
             title_line += f"\n🎶 {count} track{'s' if count != 1 else ''}"
 
         # Show track listing for playlists/albums
-        track_list = ""
-        if songs and kind != "track":
-            preview = songs[:15]
-            lines = []
-            for i, s in enumerate(preview, 1):
-                artist = s.get("artist", "")
-                name   = s.get("name", "")
-                lines.append(f"{i}. {artist} — {name}" if artist else f"{i}. {name}")
-            track_list = "\n" + "\n".join(lines)
-            if count and count > 15:
-                track_list += f"\n... and {count - 15} more"
+        track_list = _format_track_list(songs, count or 0) if kind != "track" else ""
 
         text = f"{title_line}{track_list}\n\nDownload?"
         kb   = InlineKeyboardMarkup([[
@@ -304,9 +328,10 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
             ]])
         elif info["kind"] == "playlist":
             is_playlist = True
-            text = (f"📋 {info['title']}\n"
-                    f"🎵 {info['count']} videos\n\n"
-                    f"Download all {info['count']} tracks?")
+            track_list  = _format_track_list(info.get("tracks", []), info["count"])
+            text = (f"📋 *{info['title']}*\n"
+                    f"🎵 {info['count']} videos"
+                    f"{track_list}\n\nDownload all {info['count']} tracks?")
             kb   = InlineKeyboardMarkup([[
                 InlineKeyboardButton("▶️ Download all", callback_data=f"dl:{token}:best"),
                 InlineKeyboardButton("❌ Cancel",        callback_data=f"no:{token}"),
@@ -316,7 +341,7 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
             dur     = f"  ⏱ {info['duration']}"  if info.get("duration") else ""
             blocked = info.get("blocked", False)
             warn    = "\n\n⚠️ Server IP may be blocked by YouTube.\nDownload might fail — try anyway?" if blocked else "\n\nChoose audio quality:"
-            text = f"▶️ {info['title']}{ch}{dur}{warn}"
+            text = f"▶️ *{info['title']}*{ch}{dur}{warn}"
             kb   = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔊 Best (320k)",   callback_data=f"dl:{token}:best"),
                  InlineKeyboardButton("🎧 Medium (128k)", callback_data=f"dl:{token}:mid"),
@@ -329,13 +354,15 @@ def _build_confirm(url: str, platform: str, info: dict | None) -> tuple[str, Inl
             text = "🎵 SoundCloud\n\nDownload?"
         elif info["kind"] == "playlist":
             is_playlist = True
-            text = (f"🎵 {info['title']}\n"
-                    f"🎶 {info['count']} tracks\n\n"
-                    f"Download all {info['count']} tracks?")
+            ch         = f"\n👤 {info['channel']}" if info.get("channel") else ""
+            track_list = _format_track_list(info.get("tracks", []), info["count"])
+            text = (f"🎵 *{info['title']}*{ch}\n"
+                    f"🎶 {info['count']} tracks"
+                    f"{track_list}\n\nDownload all {info['count']} tracks?")
         else:
             ch  = f"\n👤 {info['channel']}" if info.get("channel") else ""
             dur = f"  ⏱ {info['duration']}"  if info.get("duration") else ""
-            text = f"🎵 {info['title']}{ch}{dur}\n\nDownload?"
+            text = f"🎵 *{info['title']}*{ch}{dur}\n\nDownload?"
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("▶️ Download", callback_data=f"dl:{token}:best"),
             InlineKeyboardButton("❌ Cancel",   callback_data=f"no:{token}"),
