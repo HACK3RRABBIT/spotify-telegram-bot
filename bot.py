@@ -43,27 +43,34 @@ logger = logging.getLogger(__name__)
 
 _EDIT_INTERVAL = 3  # seconds between Telegram message edits
 
-# yt-dlp progress line:  "[download]  45.2% of 4.50MiB at 1.23MiB/s ETA 00:02"
-_RE_PERCENT   = re.compile(r"\[download\]\s+([\d.]+)%")
-# spotdl DEBUG: "Downloading  Artist - Title"  (1-3 spaces)
-_RE_DL_START  = re.compile(r"^Downloading\s{1,3}(.+)$")
-# spotdl DEBUG: "Downloaded  Artist - Title"
-_RE_DL_DONE   = re.compile(r"^Downloaded\s{1,3}(.+)$")
-# spotdl skipping already-cached song
-_RE_SKIP      = re.compile(r"Skipping", re.IGNORECASE)
-# any failure
-_RE_FAIL      = re.compile(r"Failed|Error", re.IGNORECASE)
+# spotdl --simple-tui output patterns (confirmed from live test):
+#   "Artist - Title: Downloading"
+#   "Artist - Title: Embedding metadata"
+#   "Artist - Title: Done"
+#   'Downloaded "Artist - Title":'
+#   "N/M complete"
+_RE_STAGE    = re.compile(r"^(.+?):\s+(Downloading|Embedding metadata|Done|Converting|Failed.*)$")
+_RE_DOWNLOADED = re.compile(r'^Downloaded\s+"(.+?)"')
+_RE_PROGRESS = re.compile(r"^(\d+)/(\d+) complete$")
 
 
-def _bar(pct: int) -> str:
-    filled = pct // 10
-    return "▓" * filled + "░" * (10 - filled)
+def _bar(filled: int, total: int = 10) -> str:
+    return "▓" * filled + "░" * (total - filled)
+
+
+# Stage → (display label, progress out of 10)
+_STAGE_MAP = {
+    "Downloading":        ("Downloading",        4),
+    "Converting":         ("Converting",         7),
+    "Embedding metadata": ("Embedding metadata", 9),
+    "Done":               ("Done",              10),
+}
 
 
 async def _run_spotdl(
     cmd: list[str], msg, timeout: int = 600
 ) -> tuple[int, str, list[str]]:
-    """Stream spotdl output and push live progress to Telegram."""
+    """Stream spotdl output; update Telegram with stage progress."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -74,11 +81,7 @@ async def _run_spotdl(
     downloaded_titles: list[str] = []
     last_edit = asyncio.get_event_loop().time()
 
-    state = {
-        "text": "Looking up track...",
-        "track": "",
-        "pct": None,
-    }
+    state = {"text": "Looking up track..."}
 
     async def read_lines():
         async for raw in proc.stdout:
@@ -88,34 +91,34 @@ async def _run_spotdl(
             all_lines.append(line)
             logger.info("spotdl: %s", line)
 
-            m = _RE_DL_START.match(line)
+            # "Artist - Title: Downloading" / "...Done" / etc.
+            m = _RE_STAGE.match(line)
             if m:
-                state["track"] = m.group(1).strip()
-                state["pct"] = 0
-                state["text"] = f"Found: *{state['track']}*\nDownloading... 0%  {_bar(0)}"
-                continue
-
-            m = _RE_PERCENT.search(line)
-            if m and state["track"]:
-                pct = min(int(float(m.group(1))), 100)
-                state["pct"] = pct
+                track, stage = m.group(1).strip(), m.group(2)
+                label, filled = _STAGE_MAP.get(stage, (stage, 5))
+                pct = filled * 10
                 state["text"] = (
-                    f"Downloading: *{state['track']}*\n"
-                    f"{pct}%  {_bar(pct)}"
+                    f"*{track}*\n"
+                    f"{label}... {pct}%  {_bar(filled)}"
                 )
                 continue
 
-            m = _RE_DL_DONE.match(line)
+            # 'Downloaded "Artist - Title":'
+            m = _RE_DOWNLOADED.match(line)
             if m:
                 title = m.group(1).strip()
                 downloaded_titles.append(title)
-                state["pct"] = 100
                 state["text"] = f"✓ *{title}*\nUploading..."
-                state["track"] = ""
                 continue
 
-            if _RE_FAIL.search(line):
-                state["text"] = f"⚠️ `{line[:120]}`"
+            # "1/3 complete"  (album progress)
+            m = _RE_PROGRESS.match(line)
+            if m:
+                done, total = int(m.group(1)), int(m.group(2))
+                state["text"] = (
+                    f"Downloaded {done}/{total} tracks\n"
+                    f"{_bar(done * 10 // total)}"
+                )
 
     reader = asyncio.create_task(read_lines())
     deadline = asyncio.get_event_loop().time() + timeout
@@ -168,9 +171,9 @@ async def handle_message(update: Update, _) -> None:
         cmd = [
             _SPOTDL_PATH,
             "--output", str(out_dir) + "/{title}",
-            "--overwrite",          # always re-download; ignore spotdl's song cache
-            "--log-level", "DEBUG", # needed to get yt-dlp [download] XX% lines
-            "--print-errors",
+            "--overwrite", "force",   # never skip due to cache
+            "--simple-tui",           # parseable line-by-line output
+            "--yt-dlp-args=--newline",# yt-dlp progress on separate lines
             url,
         ]
         logger.info("Running: %s", " ".join(cmd))
@@ -206,24 +209,23 @@ async def handle_message(update: Update, _) -> None:
                         filename=f.name,
                     )
             finally:
-                # Delete immediately after upload — don't wait for tmpdir cleanup
+                # Delete immediately after upload — free disk space track by track
                 try:
                     f.unlink()
                 except OSError:
                     pass
 
-        # Final status: just the track name(s)
+        # Final message: only the track name(s)
         titles = downloaded_titles or [f.stem for f in files]
         if len(titles) == 1:
             await msg.edit_text(f"✓ *{titles[0]}*", parse_mode="Markdown")
         else:
             bullet = "\n".join(f"• {t}" for t in titles)
             await msg.edit_text(
-                f"✓ {len(titles)} tracks sent:\n{bullet}", parse_mode="Markdown"
+                f"✓ {len(titles)} tracks:\n{bullet}", parse_mode="Markdown"
             )
 
     finally:
-        # Always wipe the temp dir (files already unlinked, but dir must go too)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
