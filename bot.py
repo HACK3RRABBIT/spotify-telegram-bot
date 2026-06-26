@@ -177,16 +177,24 @@ async def _auto_refresh_cookies() -> None:
 # So we never mix cookies with mobile clients.
 #
 # Each entry is (client_args, use_cookies).
-# Strategy order: android_vr first (fastest, works on WARP without cookies),
-# then web+cookies+deno (for age-restricted content when valid cookies exist).
+# Download strategy (tried in order, first to produce a file wins).
+#
+# curl-cffi impersonation (metube approach): spoofs Chrome's TLS fingerprint
+# at the network level — most effective against bot detection.
+# android_vr: YouTube's TV API endpoint, no login required, fast fallback.
+# web+cookies+deno: only useful for age-restricted content with valid cookies.
+#
 # NOTE: mobile clients (android_vr, ios, android) silently skip --cookies,
 # so we never pass cookies to them.
 _YT_STRATEGIES = [
+    # 1. Chrome impersonation via curl-cffi (metube-style, best bot bypass)
+    (["--impersonate", "chrome"], False),
+    # 2. android_vr API — no cookies, no JS runtime needed, reliable on WARP
     (["--extractor-args", "youtube:player_client=android_vr"], False),
-    (["--extractor-args", "youtube:player_client=mweb"], False),
-    # web client — only useful when valid cookies are present
+    # 3. web + valid cookies + Deno — for age-restricted / private content
     (["--extractor-args", "youtube:player_client=web", "--js-runtimes", "deno"], True),
-    ([], False),
+    # 4. mweb fallback
+    (["--extractor-args", "youtube:player_client=mweb"], False),
 ]
 
 
