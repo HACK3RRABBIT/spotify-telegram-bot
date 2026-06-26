@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram bot that downloads Spotify / YouTube / SoundCloud tracks using spotdl.
+Falls back to yt-dlp directly when spotdl hits YouTube bot-detection errors.
 """
 
 import os
@@ -30,9 +31,14 @@ URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_SPOTDL_PATH = os.path.join(os.path.dirname(sys.executable), "spotdl")
+_CONDA_BIN  = os.path.dirname(sys.executable)
+_SPOTDL_PATH = os.path.join(_CONDA_BIN, "spotdl")
 if not os.path.isfile(_SPOTDL_PATH):
     _SPOTDL_PATH = "spotdl"
+
+_YTDLP_PATH = os.path.join(_CONDA_BIN, "yt-dlp")
+if not os.path.isfile(_YTDLP_PATH):
+    _YTDLP_PATH = "yt-dlp"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,24 +47,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_EDIT_INTERVAL = 3  # seconds between Telegram message edits
+_EDIT_INTERVAL = 3
 
-# spotdl --simple-tui output patterns (confirmed from live test):
-#   "Artist - Title: Downloading"
-#   "Artist - Title: Embedding metadata"
-#   "Artist - Title: Done"
-#   'Downloaded "Artist - Title":'
-#   "N/M complete"
-_RE_STAGE    = re.compile(r"^(.+?):\s+(Downloading|Embedding metadata|Done|Converting|Failed.*)$")
+_RE_STAGE      = re.compile(r"^(.+?):\s+(Downloading|Embedding metadata|Done|Converting|Failed.*)$")
 _RE_DOWNLOADED = re.compile(r'^Downloaded\s+"(.+?)"')
-_RE_PROGRESS = re.compile(r"^(\d+)/(\d+) complete$")
+_RE_PROGRESS   = re.compile(r"^(\d+)/(\d+) complete$")
+# AudioProviderError line contains the YouTube URL we can retry
+_RE_PROVIDER_ERR = re.compile(r"AudioProviderError.*?(https?://\S+)")
 
-
-def _bar(filled: int, total: int = 10) -> str:
-    return "▓" * filled + "░" * (total - filled)
-
-
-# Stage → (display label, progress out of 10)
 _STAGE_MAP = {
     "Downloading":        ("Downloading",        4),
     "Converting":         ("Converting",         7),
@@ -67,60 +63,58 @@ _STAGE_MAP = {
 }
 
 
-async def _run_spotdl(
-    cmd: list[str], msg, timeout: int = 600
-) -> tuple[int, str, list[str]]:
-    """Stream spotdl output; update Telegram with stage progress."""
+def _bar(filled: int, total: int = 10) -> str:
+    return "▓" * filled + "░" * (total - filled)
+
+
+async def _stream(proc, on_line):
+    async for raw in proc.stdout:
+        line = raw.decode(errors="replace").rstrip()
+        if line:
+            on_line(line)
+
+
+async def _run_spotdl(cmd, msg, timeout=600):
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
 
-    all_lines: list[str] = []
-    downloaded_titles: list[str] = []
+    all_lines = []
+    downloaded_titles = []
+    failed_yt_urls = []
     last_edit = asyncio.get_event_loop().time()
-
     state = {"text": "Looking up track..."}
 
-    async def read_lines():
-        async for raw in proc.stdout:
-            line = raw.decode(errors="replace").rstrip()
-            if not line:
-                continue
-            all_lines.append(line)
-            logger.info("spotdl: %s", line)
+    def on_line(line):
+        all_lines.append(line)
+        logger.info("spotdl: %s", line)
 
-            # "Artist - Title: Downloading" / "...Done" / etc.
-            m = _RE_STAGE.match(line)
-            if m:
-                track, stage = m.group(1).strip(), m.group(2)
-                label, filled = _STAGE_MAP.get(stage, (stage, 5))
-                pct = filled * 10
-                state["text"] = (
-                    f"*{track}*\n"
-                    f"{label}... {pct}%  {_bar(filled)}"
-                )
-                continue
+        m = _RE_PROVIDER_ERR.search(line)
+        if m:
+            failed_yt_urls.append(m.group(1))
+            state["text"] = "⚠️ YouTube blocked — retrying with fallback..."
+            return
 
-            # 'Downloaded "Artist - Title":'
-            m = _RE_DOWNLOADED.match(line)
-            if m:
-                title = m.group(1).strip()
-                downloaded_titles.append(title)
-                state["text"] = f"✓ *{title}*\nUploading..."
-                continue
+        m = _RE_STAGE.match(line)
+        if m:
+            track, stage = m.group(1).strip(), m.group(2)
+            label, filled = _STAGE_MAP.get(stage, (stage, 5))
+            state["text"] = f"*{track}*\n{label}... {filled*10}%  {_bar(filled)}"
+            return
 
-            # "1/3 complete"  (album progress)
-            m = _RE_PROGRESS.match(line)
-            if m:
-                done, total = int(m.group(1)), int(m.group(2))
-                state["text"] = (
-                    f"Downloaded {done}/{total} tracks\n"
-                    f"{_bar(done * 10 // total)}"
-                )
+        m = _RE_DOWNLOADED.match(line)
+        if m:
+            title = m.group(1).strip()
+            downloaded_titles.append(title)
+            state["text"] = f"✓ *{title}*\nUploading..."
+            return
 
-    reader = asyncio.create_task(read_lines())
+        m = _RE_PROGRESS.match(line)
+        if m:
+            done, total = int(m.group(1)), int(m.group(2))
+            state["text"] = f"Downloaded {done}/{total} tracks\n{_bar(done * 10 // total)}"
+
+    reader = asyncio.create_task(_stream(proc, on_line))
     deadline = asyncio.get_event_loop().time() + timeout
 
     while not reader.done():
@@ -128,20 +122,83 @@ async def _run_spotdl(
         if now >= deadline:
             proc.kill()
             await reader
-            return -1, "\n".join(all_lines), downloaded_titles
-
+            return -1, "\n".join(all_lines), downloaded_titles, failed_yt_urls
         if now - last_edit >= _EDIT_INTERVAL:
             try:
                 await msg.edit_text(state["text"], parse_mode="Markdown")
             except Exception:
                 pass
             last_edit = now
-
         await asyncio.sleep(1)
 
     await reader
     rc = await proc.wait()
-    return rc, "\n".join(all_lines), downloaded_titles
+    return rc, "\n".join(all_lines), downloaded_titles, failed_yt_urls
+
+
+async def _ytdlp_fallback(yt_url: str, out_dir: Path, msg, timeout=300) -> list[Path]:
+    """
+    Download a YouTube/YT-Music URL directly via yt-dlp using player clients
+    that bypass server-side bot detection (android_vr, tv_embedded).
+    Returns list of downloaded files.
+    """
+    await msg.edit_text("YouTube blocked spotdl — retrying directly with yt-dlp...")
+
+    cmd = [
+        _YTDLP_PATH,
+        "--extractor-args", "youtube:player_client=android_vr,tv_embedded",
+        "--format", "bestaudio/best",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--embed-thumbnail",
+        "--add-metadata",
+        "--newline",
+        "--output", str(out_dir / "%(title)s.%(ext)s"),
+        yt_url,
+    ]
+    logger.info("yt-dlp fallback: %s", " ".join(cmd))
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+
+    all_lines = []
+    last_edit = asyncio.get_event_loop().time()
+    state = {"text": "Retrying download..."}
+
+    _RE_PCT = re.compile(r"\[download\]\s+([\d.]+)%")
+
+    def on_line(line):
+        all_lines.append(line)
+        logger.info("yt-dlp: %s", line)
+        m = _RE_PCT.search(line)
+        if m:
+            pct = min(int(float(m.group(1))), 100)
+            filled = pct // 10
+            state["text"] = f"Downloading (fallback)...\n{pct}%  {_bar(filled)}"
+
+    reader = asyncio.create_task(_stream(proc, on_line))
+    deadline = asyncio.get_event_loop().time() + timeout
+
+    while not reader.done():
+        now = asyncio.get_event_loop().time()
+        if now >= deadline:
+            proc.kill()
+            break
+        if now - last_edit >= _EDIT_INTERVAL:
+            try:
+                await msg.edit_text(state["text"], parse_mode="Markdown")
+            except Exception:
+                pass
+            last_edit = now
+        await asyncio.sleep(1)
+
+    await reader
+    await proc.wait()
+
+    logger.info("yt-dlp output:\n%s", "\n".join(all_lines))
+    return sorted(f for f in out_dir.iterdir() if f.is_file())
 
 
 async def start(update: Update, _) -> None:
@@ -171,17 +228,17 @@ async def handle_message(update: Update, _) -> None:
         cmd = [
             _SPOTDL_PATH,
             "--output", str(out_dir) + "/{title}",
-            "--overwrite", "force",       # never skip due to cache
-            "--simple-tui",               # parseable line-by-line output
-            "--yt-dlp-args=--newline --extractor-args youtube:player_client=ios,android",  # bypass server IP blocks
-            "--audio", "youtube-music", "youtube", "soundcloud", "piped",  # fallback sources
-            "--dont-filter-results",      # don't reject non-latin / low-score matches
+            "--overwrite", "force",
+            "--simple-tui",
+            "--yt-dlp-args=--newline",
+            "--audio", "youtube-music", "youtube", "soundcloud", "piped",
+            "--dont-filter-results",
             url,
         ]
-        logger.info("Running: %s", " ".join(cmd))
+        logger.info("Running spotdl: %s", " ".join(cmd))
 
         try:
-            rc, output, downloaded_titles = await _run_spotdl(cmd, msg)
+            rc, output, downloaded_titles, failed_yt_urls = await _run_spotdl(cmd, msg)
         except Exception as e:
             logger.exception("Subprocess error")
             await msg.edit_text(f"Error: {e}")
@@ -193,14 +250,23 @@ async def handle_message(update: Update, _) -> None:
 
         files = sorted(f for f in out_dir.iterdir() if f.is_file())
 
+        # If spotdl failed due to YouTube bot-detection, retry with yt-dlp directly
+        if not files and failed_yt_urls:
+            for yt_url in failed_yt_urls:
+                files = await _ytdlp_fallback(yt_url, out_dir, msg)
+                if files:
+                    break
+
         if not files:
             tail = "\n".join(output.splitlines()[-15:]) if output else "(no output)"
-            logger.warning("spotdl exited %d but no files found.", rc)
+            logger.warning("No files after all attempts. spotdl exit=%d", rc)
             await msg.edit_text(
-                f"No files were downloaded (exit {rc}).\n\n`{tail[:400]}`",
+                f"No files were downloaded.\n\n`{tail[:400]}`",
                 parse_mode="Markdown",
             )
             return
+
+        await msg.edit_text("Uploading...")
 
         for f in files:
             try:
@@ -211,21 +277,17 @@ async def handle_message(update: Update, _) -> None:
                         filename=f.name,
                     )
             finally:
-                # Delete immediately after upload — free disk space track by track
                 try:
                     f.unlink()
                 except OSError:
                     pass
 
-        # Final message: only the track name(s)
         titles = downloaded_titles or [f.stem for f in files]
         if len(titles) == 1:
             await msg.edit_text(f"✓ *{titles[0]}*", parse_mode="Markdown")
         else:
             bullet = "\n".join(f"• {t}" for t in titles)
-            await msg.edit_text(
-                f"✓ {len(titles)} tracks:\n{bullet}", parse_mode="Markdown"
-            )
+            await msg.edit_text(f"✓ {len(titles)} tracks:\n{bullet}", parse_mode="Markdown")
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -237,9 +299,7 @@ async def error_handler(update: Update, context) -> None:
 
 def main():
     if not TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN not set. Create a .env file or export it."
-        )
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set.")
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
